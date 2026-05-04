@@ -7,7 +7,7 @@ from road_extractor.config import ExtractionConfig
 from road_extractor.data import read_rgb, resize_image
 from road_extractor.graph import export_geojson, export_graphml, skeleton_to_graph
 from road_extractor.postprocess import classical_road_candidate_mask, repair_road_mask, skeletonize_mask
-from road_extractor.visualize import save_mask, save_overlay
+from road_extractor.visualize import save_graph_plot, save_mask, save_overlay, save_pipeline_summary_plot
 
 
 def predict_mask_with_model(
@@ -54,6 +54,8 @@ def extract_roads(
     save_mask(repaired_mask, output_dir / "repaired_mask.png")
     save_mask(skeleton, output_dir / "skeleton.png")
     save_overlay(image, repaired_mask, output_dir / "overlay.png")
+    save_graph_plot(graph, output_dir / "graph_plot.png", image.shape[:2])
+    save_pipeline_summary_plot(image, raw_mask, repaired_mask, skeleton, graph, output_dir / "pipeline_summary.png")
     export_graphml(graph, output_dir / "road_graph.graphml")
     export_geojson(graph, output_dir / "road_graph.geojson")
 

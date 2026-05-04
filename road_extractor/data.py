@@ -67,4 +67,26 @@ def make_dataset(
         mask = tf.cast(mask > 127, tf.float32)
         return image, mask
 
-    return dataset.map(load_pair, num_parallel_calls=tf.data.AUTOTUNE).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    def augment(image: tf.Tensor, mask: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
+        # Stack to ensure identical transformations for both image and mask
+        combined = tf.concat([image, mask], axis=-1)
+        
+        # Lightweight transformations
+        combined = tf.image.random_flip_left_right(combined)
+        combined = tf.image.random_flip_up_down(combined)
+        
+        # Random 90-degree rotations
+        k = tf.random.uniform((), minval=0, maxval=4, dtype=tf.int32)
+        combined = tf.image.rot90(combined, k=k)
+        
+        # Unstack back into image and mask
+        aug_image = combined[..., :3]
+        aug_mask = combined[..., 3:]
+        return aug_image, aug_mask
+
+    dataset = dataset.map(load_pair, num_parallel_calls=tf.data.AUTOTUNE)
+    if shuffle:
+        # Only augment the training dataset (where shuffle=True)
+        dataset = dataset.map(augment, num_parallel_calls=tf.data.AUTOTUNE)
+        
+    return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)

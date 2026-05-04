@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Road Extraction Demo</title>
+    <style>
+        :root {
+            --primary: #2c3e50;
+            --secondary: #3498db;
+            --bg: #f8f9fa;
+            --text: #333;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: var(--bg);
+            color: var(--text);
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        header {
+            text-align: center;
+            margin-bottom: 40px;
+            padding: 20px;
+            background-color: white;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+        }
+        h1 { color: var(--primary); }
+        .upload-section {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            text-align: center;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+            margin-bottom: 40px;
+        }
+        input[type="file"] {
+            margin-bottom: 20px;
+            font-size: 16px;
+        }
+        button {
+            background-color: var(--secondary);
+            color: white;
+            border: none;
+            padding: 12px 30px;
+            font-size: 18px;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: background 0.3s;
+        }
+        button:hover { background-color: #2980b9; }
+        
+        .results-container {
+            display: flex;
+            flex-direction: column;
+            gap: 40px;
+        }
+        .step-row {
+            display: flex;
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+            align-items: center;
+            gap: 30px;
+        }
+        .step-info {
+            flex: 1;
+        }
+        .step-info h2 { color: var(--secondary); margin-top: 0;}
+        .step-image {
+            flex: 1;
+            text-align: center;
+        }
+        .step-image img {
+            max-width: 100%;
+            height: auto;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .stats {
+            background: var(--primary);
+            color: white;
+            padding: 15px;
+            border-radius: 5px;
+            display: inline-block;
+            margin-top: 10px;
+        }
+        /* Loader */
+        #loader { display: none; margin-top: 20px; font-weight: bold; color: var(--secondary); }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <header>
+        <h1>AI-Based Road Network Extraction</h1>
+        <p>Upload a satellite image to see the complete end-to-end extraction pipeline.</p>
+    </header>
+
+    <!-- Upload Interface -->
+    <div class="upload-section">
+        <form action="/process" method="POST" enctype="multipart/form-data" onsubmit="document.getElementById('loader').style.display='block';">
+            <input type="file" name="file" accept="image/png, image/jpeg" required>
+            <br>
+            <button type="submit">Process Pipeline</button>
+        </form>
+        <div id="loader">Processing Image... Please wait.</div>
+    </div>
+
+    <!-- Results Display -->
+    {% if processed %}
+    <div class="results-container">
+        
+        <div class="step-row">
+            <div class="step-info">
+                <h2>Step 1: Original Image</h2>
+                <p>The raw satellite tile loaded into the system and resized/normalized for the pipeline.</p>
+            </div>
+            <div class="step-image">
+                <!-- t parameter prevents browser from caching the old image -->
+                <img src="/{{ upload_path }}?t={{ range(1, 1000000) | random }}" alt="Original Image">
+            </div>
+        </div>
+
+        <div class="step-row">
+            <div class="step-info">
+                <h2>Step 2: Segmentation Mask</h2>
+                <p>The raw probability map predicted by the U-Net model (or classical fallback). Notice any broken segments caused by tree occlusions.</p>
+            </div>
+            <div class="step-image">
+                <img src="/{{ output_dir }}/raw_mask.png?t={{ range(1, 1000000) | random }}" alt="Raw Mask">
+            </div>
+        </div>
+
+        <div class="step-row">
+            <div class="step-info">
+                <h2>Step 3: Post-processing (Novelty)</h2>
+                <p>Noise removal and morphological gap-filling. Elongated structural kernels physically bridge the broken gaps to restore road continuity.</p>
+            </div>
+            <div class="step-image">
+                <img src="/{{ output_dir }}/repaired_mask.png?t={{ range(1, 1000000) | random }}" alt="Repaired Mask">
+            </div>
+        </div>
+
+        <div class="step-row">
+            <div class="step-info">
+                <h2>Step 4: Skeletonization</h2>
+                <p>The continuous road mask is thinned down to a pristine 1-pixel wide centerline. This is the crucial step before graph extraction.</p>
+            </div>
+            <div class="step-image">
+                <img src="/{{ output_dir }}/skeleton.png?t={{ range(1, 1000000) | random }}" alt="Skeleton">
+            </div>
+        </div>
+
+        <div class="step-row">
+            <div class="step-info">
+                <h2>Step 5: Graph Generation</h2>
+                <p>The mathematical network representation overlayed on the original image using NetworkX. Red dots represent junctions, and blue lines represent road segments.</p>
+                <div class="stats">
+                    <strong>Extracted Features:</strong><br>
+                    Junction Nodes: {{ nodes }}<br>
+                    Road Edges: {{ edges }}
+                </div>
+            </div>
+            <div class="step-image">
+                <img src="/{{ output_dir }}/graph_plot.png?t={{ range(1, 1000000) | random }}" alt="Graph Plot">
+            </div>
+        </div>
+
+    </div>
+    {% endif %}
+
+</div>
+
+</body>
+</html>

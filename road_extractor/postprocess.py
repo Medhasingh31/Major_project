@@ -63,6 +63,14 @@ def repair_road_mask(
     closing_radius: int = 3,
     bridge_kernel_size: int = 9,
 ) -> np.ndarray:
+    """
+    MAIN PROJECT NOVELTY: Post-processing to improve road continuity.
+    This function takes the raw neural network mask and repairs it using:
+    1. Noise Removal: Removes small isolated pixel clusters (false positives).
+    2. Morphological Closing: Fills small holes inside road segments.
+    3. Gap Filling: Uses elongated horizontal and vertical kernels to bridge 
+       larger gaps caused by occlusions (like trees, vehicles, or shadows).
+    """
     binary = mask > 0
     if morphology:
         binary = morphology.remove_small_objects(binary, min_size=min_object_size)
@@ -85,6 +93,11 @@ def repair_road_mask(
 
 
 def skeletonize_mask(mask: np.ndarray) -> np.ndarray:
+    """
+    MAIN PROJECT NOVELTY: Skeletonization.
+    Reduces the repaired road mask to a 1-pixel wide centerline.
+    This is the crucial transition step required before generating the graph/network representation.
+    """
     if morphology:
         skeleton = morphology.skeletonize(mask > 0)
         return skeleton.astype(np.uint8)
