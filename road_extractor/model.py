@@ -14,7 +14,7 @@ def conv_block(inputs: tf.Tensor, filters: int) -> tf.Tensor:
 def build_light_unet(image_size: int = 256, base_filters: int = 16) -> keras.Model:
     """
     Builds a lightweight U-Net architecture suitable for moderate systems.
-    The U-Net shape downsamples the image to extract features, then upsamples 
+    The U-Net shape downsamples the image to extract features, then upsamples
     it back to the original size to generate a pixel-by-pixel mask.
     """
     inputs = keras.Input(shape=(image_size, image_size, 3))
@@ -38,32 +38,125 @@ def build_light_unet(image_size: int = 256, base_filters: int = 16) -> keras.Mod
     u1 = layers.Concatenate()([u1, c1])  # Skip connection from c1
     c5 = conv_block(u1, base_filters)
 
-    # Final Output Layer: 1x1 Convolution with Sigmoid activation for binary classification (Road = 1, Background = 0)
+    # Final Output Layer: 1x1 Conv with Sigmoid for binary road/background segmentation
     outputs = layers.Conv2D(1, 1, activation="sigmoid")(c5)
-    
+
     return keras.Model(inputs, outputs, name="light_road_unet")
 
 
-def dice_coefficient(y_true: tf.Tensor, y_pred: tf.Tensor, smooth: float = 1.0) -> tf.Tensor:
-    y_true = tf.reshape(y_true, [-1])
-    y_pred = tf.reshape(y_pred, [-1])
-    intersection = tf.reduce_sum(y_true * y_pred)
-    return (2.0 * intersection + smooth) / (tf.reduce_sum(y_true) + tf.reduce_sum(y_pred) + smooth)
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
 
+def dice_coefficient(y_true: tf.Tensor, y_pred: tf.Tensor, smooth: float = 1.0) -> tf.Tensor:
+    """
+    Sørensen-Dice coefficient computed per-batch over all pixels.
+
+    Flattening across (batch, H, W, 1) keeps the metric numerically stable
+    for highly imbalanced road/background distributions (~5% road pixels).
+    smooth=1.0 prevents division-by-zero on all-background batches.
+    """
+    y_true_f = tf.reshape(tf.cast(y_true, tf.float32), [-1])
+    y_pred_f = tf.reshape(tf.cast(y_pred, tf.float32), [-1])
+    intersection = tf.reduce_sum(y_true_f * y_pred_f)
+    return (2.0 * intersection + smooth) / (
+        tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f) + smooth
+    )
+
+
+def iou_coefficient(y_true: tf.Tensor, y_pred: tf.Tensor, smooth: float = 1.0) -> tf.Tensor:
+    """
+    Intersection-over-Union (Jaccard index) computed per-batch over all pixels.
+
+    IoU = |A ∩ B| / |A ∪ B|  = intersection / (sum_true + sum_pred - intersection)
+
+    Threshold: predictions are treated as soft probabilities; the product
+    y_true * y_pred approximates the soft intersection, matching how Dice
+    is computed so both metrics are consistent.
+    """
+    y_true_f = tf.reshape(tf.cast(y_true, tf.float32), [-1])
+    y_pred_f = tf.reshape(tf.cast(y_pred, tf.float32), [-1])
+    intersection = tf.reduce_sum(y_true_f * y_pred_f)
+    union = tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f) - intersection
+    return (intersection + smooth) / (union + smooth)
+
+
+# ---------------------------------------------------------------------------
+# Loss functions
+# ---------------------------------------------------------------------------
 
 def dice_loss(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
+    """
+    Dice loss = 1 − Dice coefficient.
+
+    Directly optimises overlap between prediction and ground truth.
+    Works well for class-imbalanced segmentation (road ≈ 5% of pixels).
+    """
     return 1.0 - dice_coefficient(y_true, y_pred)
 
 
-def compile_model(model: keras.Model, learning_rate: float = 1e-3) -> keras.Model:
+def combined_loss(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
     """
-    Compiles the model with standard configurations for binary segmentation.
-    - Optimizer: Adam (efficient for training)
-    - Loss: Binary Crossentropy (ideal for pixel-wise 0 or 1 classification)
+    Combined Dice + Binary Cross-Entropy loss (equal weighting).
+
+    Rationale for DeepGlobe roads (~5% road pixels):
+      - BCE alone: gradients dominated by easy background pixels; road recall suffers.
+      - Dice alone: insensitive to absolute pixel counts; misses fine calibration.
+      - Combined: Dice drives overlap (handles imbalance); BCE anchors pixel-level
+        probability calibration.  Sum of both is a standard best practice for
+        road/vessel segmentation on imbalanced datasets.
+
+    Both terms are in [0, 1], so the combined loss is in [0, 2].
+    Keras logs it as-is; lower is better.
     """
+    bce = tf.keras.losses.binary_crossentropy(y_true, y_pred)
+    bce = tf.reduce_mean(bce)
+    return dice_loss(y_true, y_pred) + bce
+
+
+# ---------------------------------------------------------------------------
+# Model compilation
+# ---------------------------------------------------------------------------
+
+# Map CLI-friendly loss names to callables
+LOSS_REGISTRY: dict[str, object] = {
+    "combined": combined_loss,
+    "dice":     dice_loss,
+    "bce":      tf.keras.losses.BinaryCrossentropy(),
+}
+
+LOSS_DISPLAY_NAMES: dict[str, str] = {
+    "combined": "Dice + Binary Cross-Entropy (combined)",
+    "dice":     "Dice loss",
+    "bce":      "Binary Cross-Entropy",
+}
+
+
+def compile_model(
+    model: keras.Model,
+    learning_rate: float = 1e-3,
+    loss_name: str = "combined",
+) -> keras.Model:
+    """
+    Compile the U-Net for binary road segmentation.
+
+    Loss choices (pass via loss_name):
+      'combined'  — Dice + BCE  [default, recommended for imbalanced data]
+      'dice'      — Dice loss only
+      'bce'       — Binary Cross-Entropy only
+
+    Metrics tracked every epoch:
+      - dice_coefficient  (primary validation metric for checkpointing)
+      - iou_coefficient   (Jaccard index, standard for segmentation benchmarks)
+      - binary_accuracy   (pixel-level accuracy, included for completeness)
+    """
+    if loss_name not in LOSS_REGISTRY:
+        raise ValueError(
+            f"Unknown loss '{loss_name}'. Choose from: {list(LOSS_REGISTRY.keys())}"
+        )
     model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate),
-        loss=keras.losses.BinaryCrossentropy(),
-        metrics=[dice_coefficient, "binary_accuracy"],
+        optimizer=keras.optimizers.Adam(learning_rate=learning_rate),
+        loss=LOSS_REGISTRY[loss_name],
+        metrics=[dice_coefficient, iou_coefficient, "binary_accuracy"],
     )
     return model

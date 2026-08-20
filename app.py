@@ -1,4 +1,5 @@
 import os
+
 from pathlib import Path
 from flask import Flask, render_template, request, redirect, url_for
 
@@ -31,36 +32,36 @@ def process():
     if file.filename == '':
         return redirect(url_for('index'))
         
-    if file:
-        # 2. Save uploaded image locally
-        filename = "input_image.png"
-        upload_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(upload_path)
-        
-        # 3. Setup paths for pipeline
-        output_dir = os.path.join(app.config['OUTPUT_FOLDER'], 'run')
-        weights_path = Path("models/road_unet.keras")
-        # Automatically use classical fallback if weights don't exist
-        weights = str(weights_path) if weights_path.exists() else None
-        
-        # 4. Run the Pipeline
-        # This dynamically generates raw_mask.png, repaired_mask.png, skeleton.png, graph_plot.png
-        result = extract_roads(
-            image_path=upload_path,
-            output_dir=output_dir,
-            weights_path=weights, 
-            config=ExtractionConfig()
-        )
-        
-        # 5. Pass results back to frontend
-        # The frontend will read the images directly from the static/outputs/run/ directory
-        return render_template('index.html', 
-                               processed=True,
-                               nodes=result['nodes'],
-                               edges=result['edges'],
-                               upload_path=upload_path.replace('\\', '/'),
-                               output_dir=output_dir.replace('\\', '/'))
+    # 2. Save uploaded image locally
+    filename = "input_image.png"
+    upload_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    file.save(upload_path)
+    
+    # 3. Setup paths for pipeline
+    output_dir = os.path.join(app.config['OUTPUT_FOLDER'], 'run')
+    weights_path = Path("models/road_unet.keras")
+    # Automatically use classical fallback if weights don't exist
+    weights = str(weights_path) if weights_path.exists() else None
+    
+    # 4. Run the Pipeline
+    # This dynamically generates raw_mask.png, repaired_mask.png, skeleton.png, graph_plot.png
+    result = extract_roads(
+        image_path=upload_path,
+        output_dir=output_dir,
+        weights_path=weights, 
+        config=ExtractionConfig()
+    )
+    
+    # 5. Pass results back to frontend
+    # The frontend will read the images directly from the static/outputs/run/ directory
+    return render_template('index.html', 
+                           processed=True,
+                           nodes=result['nodes'],
+                           edges=result['edges'],
+                           upload_path=upload_path.replace('\\', '/'),
+                           output_dir=output_dir.replace('\\', '/'))
 
 if __name__ == '__main__':
     # Runs locally on http://127.0.0.1:5000
-    app.run(debug=True, port=5000)
+    # threaded=False ensures Keras doesn't crash trying to load weights in a worker thread
+    app.run(debug=True, use_reloader=False, threaded=False, port=5000)

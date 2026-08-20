@@ -1,0 +1,75 @@
+# ==========================================
+# Environments & Package Managers
+# ==========================================
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ==========================================
+# Python Bytecode & Cache
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.cpython-*.pyc
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# ==========================================
+# Datasets & Large Archives (Do not push to Git)
+# ==========================================
+dataset/
+data/
+archive/
+*.tar.gz
+*.zip
+*.tar
+*.rar
+
+# ==========================================
+# Model Weights & Checkpoints
+# ==========================================
+# Allow lightweight trained road model (~1.5 MB)
+!models/road_unet.keras
+!*.keras
+*.h5
+*.hdf5
+*.pth
+*.pt
+*.onnx
+*.tflite
+*.ckpt
+*.pb
+
+# ==========================================
+# Dynamic Uploads, Outputs & Runtime Artifacts
+# ==========================================
+static/uploads/*
+!static/uploads/.gitkeep
+static/outputs/*
+!static/outputs/.gitkeep
+outputs/*
+!outputs/.gitkeep
+training_log.csv
+*.log
+
+# ==========================================
+# IDE & System Files
+# ==========================================
+.vscode/
+.idea/
+.spyderproject/
+.spyproject/
+.ipynb_checkpoints/
+pyrightconfig.json
+
+# OS generated files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+[Nn]anorc

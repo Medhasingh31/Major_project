@@ -73,10 +73,10 @@ def repair_road_mask(
     """
     binary = mask > 0
     if morphology:
-        binary = morphology.remove_small_objects(binary, min_size=min_object_size)
-        binary = morphology.remove_small_holes(binary, area_threshold=min_object_size)
+        binary = morphology.remove_small_objects(binary, max_size=min_object_size)
+        binary = morphology.remove_small_holes(binary, max_size=min_object_size)
         selem = morphology.disk(closing_radius)
-        closed = morphology.binary_closing(binary, selem)
+        closed = morphology.closing(binary, selem)
     else:
         binary = _remove_small_components(binary, min_size=min_object_size)
         binary = _remove_small_holes(binary, min_size=min_object_size)

@@ -3,169 +3,329 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AI Road Extraction Demo</title>
+    <title>AI Road Extraction Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&display=swap" rel="stylesheet">
     <style>
         :root {
-            --primary: #2c3e50;
-            --secondary: #3498db;
-            --bg: #f8f9fa;
-            --text: #333;
+            --bg-color: #0b0f19;
+            --card-bg: rgba(22, 30, 45, 0.6);
+            --border-color: rgba(64, 196, 255, 0.2);
+            --primary: #00d2ff;
+            --secondary: #3a7bd5;
+            --text-main: #f0f4f8;
+            --text-muted: #9ba3af;
         }
+
         body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background-color: var(--bg);
-            color: var(--text);
+            font-family: 'Inter', sans-serif;
+            background: var(--bg-color);
+            background-image: radial-gradient(circle at top right, rgba(0, 210, 255, 0.05), transparent 40%),
+                              radial-gradient(circle at bottom left, rgba(58, 123, 213, 0.05), transparent 40%);
+            color: var(--text-main);
             margin: 0;
-            padding: 20px;
+            padding: 40px 20px;
+            min-height: 100vh;
         }
+
         .container {
-            max-width: 1200px;
+            max-width: 1000px;
             margin: 0 auto;
         }
+
+        /* Glassmorphism Base */
+        .glass-panel {
+            background: var(--card-bg);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
+        }
+
         header {
             text-align: center;
+            padding: 40px 20px;
             margin-bottom: 40px;
-            padding: 20px;
-            background-color: white;
-            border-radius: 10px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
         }
-        h1 { color: var(--primary); }
+
+        h1 {
+            font-size: 2.5rem;
+            font-weight: 800;
+            margin: 0 0 10px 0;
+            background: linear-gradient(90deg, var(--primary), var(--secondary));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            letter-spacing: -0.5px;
+        }
+
+        header p {
+            color: var(--text-muted);
+            font-size: 1.1rem;
+            margin: 0;
+        }
+
+        /* Upload Section */
         .upload-section {
-            background: white;
-            padding: 30px;
-            border-radius: 10px;
+            padding: 50px 30px;
             text-align: center;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
-            margin-bottom: 40px;
+            margin-bottom: 50px;
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
         }
+
+        .upload-section:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 12px 40px 0 rgba(0, 210, 255, 0.1);
+            border-color: rgba(0, 210, 255, 0.4);
+        }
+
+        .file-drop-area {
+            border: 2px dashed rgba(64, 196, 255, 0.4);
+            border-radius: 10px;
+            padding: 40px 20px;
+            background: rgba(0, 0, 0, 0.2);
+            margin-bottom: 25px;
+            position: relative;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        .file-drop-area:hover {
+            border-color: var(--primary);
+            background: rgba(0, 210, 255, 0.05);
+        }
+
         input[type="file"] {
-            margin-bottom: 20px;
-            font-size: 16px;
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            opacity: 0;
+            cursor: pointer;
         }
+
+        .file-msg {
+            font-size: 1.2rem;
+            color: var(--text-muted);
+            font-weight: 300;
+        }
+
         button {
-            background-color: var(--secondary);
+            background: linear-gradient(135deg, var(--secondary), var(--primary));
             color: white;
             border: none;
-            padding: 12px 30px;
-            font-size: 18px;
-            border-radius: 5px;
+            padding: 14px 40px;
+            font-size: 1.1rem;
+            font-weight: 600;
+            border-radius: 30px;
             cursor: pointer;
-            transition: background 0.3s;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(0, 210, 255, 0.3);
         }
-        button:hover { background-color: #2980b9; }
-        
+
+        button:hover {
+            transform: translateY(-2px) scale(1.02);
+            box-shadow: 0 6px 20px rgba(0, 210, 255, 0.5);
+        }
+
+        /* Animated Loader */
+        #loader-container {
+            display: none;
+            margin-top: 30px;
+        }
+
+        .spinner {
+            width: 40px;
+            height: 40px;
+            margin: 0 auto 15px;
+            border: 4px solid rgba(0, 210, 255, 0.1);
+            border-left-color: var(--primary);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .loader-text {
+            color: var(--primary);
+            font-weight: 600;
+            letter-spacing: 1px;
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 0.6; }
+            50% { opacity: 1; }
+        }
+
+        /* Results Display */
         .results-container {
             display: flex;
             flex-direction: column;
-            gap: 40px;
-        }
-        .step-row {
-            display: flex;
-            background: white;
-            padding: 20px;
-            border-radius: 10px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
-            align-items: center;
             gap: 30px;
         }
+
+        .step-row {
+            display: flex;
+            padding: 30px;
+            align-items: center;
+            gap: 40px;
+            opacity: 0;
+            transform: translateY(20px);
+            animation: fadeUp 0.6s ease forwards;
+        }
+
+        /* Staggered animation delays for rows */
+        .step-row:nth-child(1) { animation-delay: 0.1s; }
+        .step-row:nth-child(2) { animation-delay: 0.3s; }
+        .step-row:nth-child(3) { animation-delay: 0.5s; }
+        .step-row:nth-child(4) { animation-delay: 0.7s; }
+        .step-row:nth-child(5) { animation-delay: 0.9s; }
+
+        @keyframes fadeUp {
+            to { opacity: 1; transform: translateY(0); }
+        }
+
         .step-info {
             flex: 1;
         }
-        .step-info h2 { color: var(--secondary); margin-top: 0;}
+
+        .step-info h2 {
+            color: var(--primary);
+            margin-top: 0;
+            font-weight: 600;
+            font-size: 1.5rem;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .step-info p {
+            color: var(--text-muted);
+            line-height: 1.6;
+        }
+
         .step-image {
             flex: 1;
             text-align: center;
+            position: relative;
         }
+
         .step-image img {
             max-width: 100%;
             height: auto;
-            border-radius: 8px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            border-radius: 12px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+            transition: transform 0.3s ease;
         }
+
+        .step-image img:hover {
+            transform: scale(1.03);
+        }
+
+        /* Highlight box for stats */
         .stats {
-            background: var(--primary);
-            color: white;
-            padding: 15px;
-            border-radius: 5px;
+            background: rgba(0, 0, 0, 0.3);
+            border-left: 4px solid var(--primary);
+            padding: 15px 20px;
+            border-radius: 0 8px 8px 0;
+            margin-top: 20px;
             display: inline-block;
-            margin-top: 10px;
         }
-        /* Loader */
-        #loader { display: none; margin-top: 20px; font-weight: bold; color: var(--secondary); }
+        
+        .stats strong {
+            color: var(--primary);
+            display: block;
+            margin-bottom: 5px;
+        }
+
+        /* File Input Interaction Script */
+        .file-drop-area.active {
+            border-color: var(--primary);
+            background: rgba(0, 210, 255, 0.1);
+        }
+
     </style>
 </head>
 <body>
 
 <div class="container">
-    <header>
-        <h1>AI-Based Road Network Extraction</h1>
-        <p>Upload a satellite image to see the complete end-to-end extraction pipeline.</p>
+    <header class="glass-panel">
+        <h1>Road Network Extraction AI</h1>
+        <p>Powered by a Fine-Tuned U-Net & Morphological Synthesis</p>
     </header>
 
     <!-- Upload Interface -->
-    <div class="upload-section">
-        <form action="/process" method="POST" enctype="multipart/form-data" onsubmit="document.getElementById('loader').style.display='block';">
-            <input type="file" name="file" accept="image/png, image/jpeg" required>
-            <br>
-            <button type="submit">Process Pipeline</button>
+    <div class="upload-section glass-panel">
+        <form action="/process" method="POST" enctype="multipart/form-data" id="upload-form">
+            <div class="file-drop-area" id="drop-area">
+                <span class="file-msg" id="file-msg">Drag & Drop a satellite tile here, or click to browse</span>
+                <input type="file" name="file" id="file-input" accept="image/png, image/jpeg" required>
+            </div>
+            <button type="submit">Initialize Pipeline</button>
         </form>
-        <div id="loader">Processing Image... Please wait.</div>
+        
+        <div id="loader-container">
+            <div class="spinner"></div>
+            <div class="loader-text">RUNNING INFERENCE & GRAPH EXTRACTION...</div>
+        </div>
     </div>
 
     <!-- Results Display -->
     {% if processed %}
     <div class="results-container">
         
-        <div class="step-row">
+        <div class="step-row glass-panel">
             <div class="step-info">
-                <h2>Step 1: Original Image</h2>
-                <p>The raw satellite tile loaded into the system and resized/normalized for the pipeline.</p>
+                <h2><span style="opacity:0.5">01 //</span> Input Telemetry</h2>
+                <p>The raw satellite image tile acquired by the system. It is automatically normalized and resized into the operational tensor shape for the AI model.</p>
             </div>
             <div class="step-image">
-                <!-- t parameter prevents browser from caching the old image -->
                 <img src="/{{ upload_path }}?t={{ range(1, 1000000) | random }}" alt="Original Image">
             </div>
         </div>
 
-        <div class="step-row">
+        <div class="step-row glass-panel" style="flex-direction: row-reverse;">
             <div class="step-info">
-                <h2>Step 2: Segmentation Mask</h2>
-                <p>The raw probability map predicted by the U-Net model (or classical fallback). Notice any broken segments caused by tree occlusions.</p>
+                <h2><span style="opacity:0.5">02 //</span> Neural Activation</h2>
+                <p>The raw probability map predicted by the deep U-Net architecture. Bright regions indicate a high confidence of road presence. Notice any disconnected segments caused by tree canopies or shadows.</p>
             </div>
             <div class="step-image">
                 <img src="/{{ output_dir }}/raw_mask.png?t={{ range(1, 1000000) | random }}" alt="Raw Mask">
             </div>
         </div>
 
-        <div class="step-row">
+        <div class="step-row glass-panel">
             <div class="step-info">
-                <h2>Step 3: Post-processing (Novelty)</h2>
-                <p>Noise removal and morphological gap-filling. Elongated structural kernels physically bridge the broken gaps to restore road continuity.</p>
+                <h2><span style="opacity:0.5">03 //</span> Morphological Synthesis</h2>
+                <p>Advanced noise removal and gap-filling algorithms. Directed structural kernels actively bridge fractured spatial connections to physically restore road continuity.</p>
             </div>
             <div class="step-image">
                 <img src="/{{ output_dir }}/repaired_mask.png?t={{ range(1, 1000000) | random }}" alt="Repaired Mask">
             </div>
         </div>
 
-        <div class="step-row">
+        <div class="step-row glass-panel" style="flex-direction: row-reverse;">
             <div class="step-info">
-                <h2>Step 4: Skeletonization</h2>
-                <p>The continuous road mask is thinned down to a pristine 1-pixel wide centerline. This is the crucial step before graph extraction.</p>
+                <h2><span style="opacity:0.5">04 //</span> Skeletonization</h2>
+                <p>The continuous binary mask is eroded down to a pristine, one-pixel-wide centerline. This perfectly preserves the topology required for the final graph generation.</p>
             </div>
             <div class="step-image">
                 <img src="/{{ output_dir }}/skeleton.png?t={{ range(1, 1000000) | random }}" alt="Skeleton">
             </div>
         </div>
 
-        <div class="step-row">
+        <div class="step-row glass-panel">
             <div class="step-info">
-                <h2>Step 5: Graph Generation</h2>
-                <p>The mathematical network representation overlayed on the original image using NetworkX. Red dots represent junctions, and blue lines represent road segments.</p>
+                <h2><span style="opacity:0.5">05 //</span> Topological Graph</h2>
+                <p>The mathematical network representation overlayed onto the original image. Intersections are mapped as nodes (red) and roads as edges (blue) using NetworkX.</p>
                 <div class="stats">
-                    <strong>Extracted Features:</strong><br>
+                    <strong>Network Metrics Captured:</strong><br>
                     Junction Nodes: {{ nodes }}<br>
-                    Road Edges: {{ edges }}
+                    Traversable Edges: {{ edges }}
                 </div>
             </div>
             <div class="step-image">
@@ -175,8 +335,51 @@
 
     </div>
     {% endif %}
-
 </div>
 
+<script>
+    // UX Enhancements for File Input
+    const fileInput = document.getElementById('file-input');
+    const fileMsg = document.getElementById('file-msg');
+    const dropArea = document.getElementById('drop-area');
+    const uploadForm = document.getElementById('upload-form');
+    const loaderContainer = document.getElementById('loader-container');
+
+    fileInput.addEventListener('change', function(e) {
+        if(e.target.files.length > 0) {
+            fileMsg.textContent = "Selected: " + e.target.files[0].name;
+            fileMsg.style.color = "var(--primary)";
+        }
+    });
+
+    dropArea.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        dropArea.classList.add('active');
+    });
+
+    dropArea.addEventListener('dragleave', () => {
+        dropArea.classList.remove('active');
+    });
+
+    dropArea.addEventListener('drop', (e) => {
+        e.preventDefault();
+        dropArea.classList.remove('active');
+        if(e.dataTransfer.files.length > 0) {
+            fileInput.files = e.dataTransfer.files;
+            fileMsg.textContent = "Selected: " + e.dataTransfer.files[0].name;
+            fileMsg.style.color = "var(--primary)";
+        }
+    });
+
+    uploadForm.addEventListener('submit', function() {
+        if(fileInput.files.length > 0) {
+            loaderContainer.style.display = 'block';
+            const btn = document.querySelector('button');
+            btn.style.opacity = '0.5';
+            btn.style.pointerEvents = 'none';
+            btn.textContent = 'Processing...';
+        }
+    });
+</script>
 </body>
 </html>
