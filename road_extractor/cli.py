@@ -1,13 +1,5 @@
 import argparse
 import os
-os.environ["TF_USE_LEGACY_KERAS"] = "1"
-from pathlib import Path
-
-from road_extractor.config import ExtractionConfig, TrainingConfig
-from road_extractor.pipeline import extract_roads
-
-
-import argparse
 import math
 from pathlib import Path
 
@@ -81,7 +73,14 @@ def train(args: argparse.Namespace) -> None:
             val_fraction=config.val_fraction,
         )
         print_deepglobe_summary(train_pairs, val_pairs, config.image_size)
-        train_ds = make_deepglobe_dataset(train_pairs, config.image_size, config.batch_size, shuffle=True)
+        train_ds = make_deepglobe_dataset(
+            train_pairs,
+            config.image_size,
+            config.batch_size,
+            shuffle=True,
+            apply_occlusion=getattr(args, "occlusion_aug", False),
+            occlusion_prob=getattr(args, "occlusion_prob", 0.40),
+        )
         val_ds   = make_deepglobe_dataset(val_pairs,   config.image_size, config.batch_size, shuffle=False)
     else:
         # ── Legacy separate-folder mode ────────────────────────────────────
@@ -120,7 +119,11 @@ def train(args: argparse.Namespace) -> None:
     # ── Build and compile model ────────────────────────────────────────────
     model = build_light_unet(config.image_size, config.base_filters)
     
-    if getattr(args, "fine_tune", False):
+    base_weights = getattr(args, "base_weights", None)
+    if base_weights and Path(base_weights).exists():
+        print(f"\n[Fine-Tune] Loading baseline weights from {base_weights}...")
+        model.load_weights(str(base_weights))
+    elif getattr(args, "fine_tune", False):
         print(f"\n[Fine-Tune] Loading existing weights from {output_path}...")
         model.load_weights(str(output_path))
         # Use a very low learning rate for fine-tuning
@@ -190,6 +193,31 @@ def extract(args: argparse.Namespace) -> None:
     print(f"Outputs written to: {result['output_dir']}")
 
 
+def evaluate_exp(args: argparse.Namespace) -> None:
+    from road_extractor.evaluate_experiment import run_comparative_experiment
+    run_comparative_experiment(
+        deepglobe_root=args.deepglobe,
+        baseline_model_path=args.baseline,
+        occlusion_model_path=args.occlusion_model,
+        output_dir=args.output,
+        image_size=args.image_size,
+        threshold=args.threshold,
+    )
+
+
+def visualize_exp(args: argparse.Namespace) -> None:
+    from road_extractor.visualize_experiment import generate_qualitative_suite
+    generate_qualitative_suite(
+        deepglobe_root=args.deepglobe,
+        baseline_model_path=args.baseline,
+        occlusion_model_path=args.occlusion_model,
+        output_dir=args.output,
+        num_samples=args.num_samples,
+        image_size=args.image_size,
+        threshold=args.threshold,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Lightweight road extraction and graph generation")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -215,6 +243,9 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--val-images", default=None)
     train_parser.add_argument("--val-masks", default=None)
     train_parser.add_argument("--output", default="models/road_unet.keras")
+    train_parser.add_argument("--base-weights", default=None, help="Base pretrained weights to initialize from")
+    train_parser.add_argument("--occlusion-aug", action="store_true", help="Apply realistic occlusion augmentation during training")
+    train_parser.add_argument("--occlusion-prob", type=float, default=0.40, help="Probability of applying occlusion per training image")
     train_parser.add_argument("--image-size", type=int, default=256)
     train_parser.add_argument("--batch-size", type=int, default=4)
     train_parser.add_argument("--epochs", type=int, default=20)
@@ -246,6 +277,25 @@ def build_parser() -> argparse.ArgumentParser:
     extract_parser.add_argument("--closing-radius", type=int, default=3)
     extract_parser.add_argument("--bridge-kernel-size", type=int, default=9)
     extract_parser.set_defaults(func=extract)
+
+    eval_parser = subparsers.add_parser("evaluate-experiment", help="Compare baseline vs occlusion-trained model")
+    eval_parser.add_argument("--deepglobe", default="dataset")
+    eval_parser.add_argument("--baseline", default="models/road_unet.keras")
+    eval_parser.add_argument("--occlusion-model", default="models/road_unet_occlusion.keras")
+    eval_parser.add_argument("--output", default="outputs/experiments")
+    eval_parser.add_argument("--image-size", type=int, default=256)
+    eval_parser.add_argument("--threshold", type=float, default=0.40)
+    eval_parser.set_defaults(func=evaluate_exp)
+
+    vis_parser = subparsers.add_parser("visualize-experiment", help="Generate 5-panel qualitative comparison figures")
+    vis_parser.add_argument("--deepglobe", default="dataset")
+    vis_parser.add_argument("--baseline", default="models/road_unet.keras")
+    vis_parser.add_argument("--occlusion-model", default="models/road_unet_occlusion.keras")
+    vis_parser.add_argument("--output", default="outputs/experiments/qualitative_comparisons")
+    vis_parser.add_argument("--num-samples", type=int, default=8)
+    vis_parser.add_argument("--image-size", type=int, default=256)
+    vis_parser.add_argument("--threshold", type=float, default=0.40)
+    vis_parser.set_defaults(func=visualize_exp)
 
     return parser
 

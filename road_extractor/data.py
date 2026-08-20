@@ -148,6 +148,9 @@ def make_deepglobe_dataset(
     image_size: int,
     batch_size: int,
     shuffle: bool,
+    apply_occlusion: bool = False,
+    occlusion_prob: float = 0.40,
+    cache: bool = True,
 ) -> "tf.data.Dataset":
     """
     Build a tf.data.Dataset from a list of (sat_path, mask_path) pairs.
@@ -163,12 +166,12 @@ def make_deepglobe_dataset(
       - binarised: road = 1.0, background = 0.0
       - kept as shape (H, W, 1) to match U-Net output
 
-    Training datasets (shuffle=True) also apply lightweight augmentation:
-      - random horizontal flip
-      - random vertical flip
-      - random 90-degree rotation
+    Training datasets (shuffle=True) apply geometric & photometric augmentation.
+    If apply_occlusion=True, realistic tree/building/shadow occlusions are applied
+    exclusively to training images while preserving ground truth masks.
     """
     import tensorflow as tf
+    from road_extractor.occlusion import py_realistic_occlusion_aug
 
     sat_paths  = [p for p, _ in pairs]
     mask_paths = [m for _, m in pairs]
@@ -210,9 +213,26 @@ def make_deepglobe_dataset(
         
         return aug_image, aug_mask
 
+    def tf_occlusion_aug(image: tf.Tensor, mask: tf.Tensor):
+        def _py_wrapper(img_np, msk_np):
+            return py_realistic_occlusion_aug(img_np, msk_np, p=occlusion_prob)
+
+        occ_img, occ_mask = tf.numpy_function(
+            _py_wrapper,
+            [image, mask],
+            [tf.float32, tf.float32],
+        )
+        occ_img.set_shape([image_size, image_size, 3])
+        occ_mask.set_shape([image_size, image_size, 1])
+        return occ_img, occ_mask
+
     dataset = dataset.map(load_pair, num_parallel_calls=tf.data.AUTOTUNE)
+    if cache:
+        dataset = dataset.cache()
     if shuffle:
         dataset = dataset.map(augment, num_parallel_calls=tf.data.AUTOTUNE)
+        if apply_occlusion:
+            dataset = dataset.map(tf_occlusion_aug, num_parallel_calls=tf.data.AUTOTUNE)
 
     return dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
