@@ -4,7 +4,7 @@ from pathlib import Path
 from flask import Flask, render_template, request, redirect, url_for
 
 from road_extractor.pipeline import extract_roads
-from road_extractor.config import ExtractionConfig
+from road_extractor.config import ExtractionConfig, get_default_weights_path
 
 # Initialize Flask App
 app = Flask(__name__)
@@ -39,8 +39,7 @@ def process():
     
     # 3. Setup paths for pipeline
     output_dir = os.path.join(app.config['OUTPUT_FOLDER'], 'run')
-    weights_path = Path("models/road_unet.keras")
-    # Automatically use classical fallback if weights don't exist
+    weights_path = get_default_weights_path()
     weights = str(weights_path) if weights_path.exists() else None
     
     # 4. Run the Pipeline

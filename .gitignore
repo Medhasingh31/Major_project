@@ -49,12 +49,9 @@ archive/
 # ==========================================
 # Dynamic Uploads, Outputs & Runtime Artifacts
 # ==========================================
-static/uploads/*
-!static/uploads/.gitkeep
-static/outputs/*
-!static/outputs/.gitkeep
-outputs/*
-!outputs/.gitkeep
+static/uploads/
+static/outputs/
+outputs/
 training_log.csv
 *.log
 

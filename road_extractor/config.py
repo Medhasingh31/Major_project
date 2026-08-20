@@ -1,4 +1,13 @@
+from pathlib import Path
 from dataclasses import dataclass, field
+
+
+def get_default_weights_path() -> Path:
+    """Return occlusion-resilient model if available, otherwise baseline model."""
+    p_occ = Path("models/road_unet_occlusion.keras")
+    if p_occ.exists():
+        return p_occ
+    return Path("models/road_unet.keras")
 
 
 @dataclass
@@ -10,10 +19,10 @@ class ExtractionConfig:
     use_multiscale: bool = True     # Multi-scale contextual pyramid (Global context + Local detail)
     global_weight: float = 0.60     # Weight for global macroscopic semantic context
     local_weight: float = 0.40      # Weight for local high-resolution tiled detail
-    threshold: float = 0.24         # Balanced threshold for thin rural paths and urban grids
-    min_object_size: int = 48       # Removes isolated noise specks while keeping connected road networks
-    closing_radius: int = 4         # Morphological closing radius
-    bridge_kernel_size: int = 11    # Directional bridge kernel size
+    threshold: float = 0.18         # Sensitive threshold to capture occluded forest tracks
+    min_object_size: int = 32       # Keeps fine winding rural pathways
+    closing_radius: int = 6         # Morphological closing radius across canopy breaks
+    bridge_kernel_size: int = 15    # Directional bridge kernel for tree occlusion gaps
     graph_simplify_pixels: int = 12 # Road graph simplification tolerance
 
 

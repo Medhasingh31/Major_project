@@ -3,7 +3,7 @@ import os
 import math
 from pathlib import Path
 
-from road_extractor.config import ExtractionConfig, TrainingConfig
+from road_extractor.config import ExtractionConfig, TrainingConfig, get_default_weights_path
 from road_extractor.pipeline import extract_roads
 
 
@@ -269,7 +269,7 @@ def build_parser() -> argparse.ArgumentParser:
     extract_parser = subparsers.add_parser("extract", help="Extract roads and export graph outputs")
     extract_parser.add_argument("--image", required=True)
     extract_parser.add_argument("--output", default="outputs/run")
-    extract_parser.add_argument("--weights", default="models/road_unet.keras")
+    extract_parser.add_argument("--weights", default=str(get_default_weights_path()), help="Path to U-Net model weights (defaults to occlusion-trained model)")
     extract_parser.add_argument("--no-model", action="store_true", help="Use classical fallback instead of model weights")
     extract_parser.add_argument("--image-size", type=int, default=256)
     extract_parser.add_argument("--threshold", type=float, default=0.5)

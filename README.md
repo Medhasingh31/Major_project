@@ -35,10 +35,16 @@ python scripts/create_synthetic_sample.py
 python -m road_extractor.cli extract --image data/sample/input.png --output outputs/demo --no-model
 ```
 
-With a trained model:
+With the trained occlusion-resilient model:
 
 ```powershell
-python -m road_extractor.cli extract --image data/sample/input.png --output outputs/demo --weights models/road_unet.keras
+python -m road_extractor.cli extract --image data/sample/input.png --output outputs/demo --weights models/road_unet_occlusion.keras
+```
+
+Or simply run without `--weights` (the system automatically defaults to `models/road_unet_occlusion.keras`):
+
+```powershell
+python -m road_extractor.cli extract --image data/sample/input.png --output outputs/demo
 ```
 
 ## Train A Small Model
