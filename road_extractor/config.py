@@ -19,7 +19,7 @@ class ExtractionConfig:
     use_multiscale: bool = True     # Multi-scale contextual pyramid (Global context + Local detail)
     global_weight: float = 0.60     # Weight for global macroscopic semantic context
     local_weight: float = 0.40      # Weight for local high-resolution tiled detail
-    threshold: float = 0.18         # Sensitive threshold to capture occluded forest tracks
+    threshold: float = 0.30         # Ground-truth-selected precision/recall baseline
     min_object_size: int = 32       # Keeps fine winding rural pathways
     closing_radius: int = 6         # Morphological closing radius across canopy breaks
     bridge_kernel_size: int = 15    # Directional bridge kernel for tree occlusion gaps

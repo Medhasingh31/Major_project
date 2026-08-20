@@ -1,9 +1,11 @@
 import argparse
+from logging import config
 import os
 import math
 from pathlib import Path
 
 from road_extractor.config import ExtractionConfig, TrainingConfig, get_default_weights_path
+from road_extractor.model import compile_model
 from road_extractor.pipeline import extract_roads
 
 
@@ -116,19 +118,44 @@ def train(args: argparse.Namespace) -> None:
     # ── Pre-training configuration summary ────────────────────────────────
     _print_training_config(train_pairs, val_pairs, config, str(output_path))
 
-    # ── Build and compile model ────────────────────────────────────────────
-    model = build_light_unet(config.image_size, config.base_filters)
-    
+    # ── Build / load model ────────────────────────────────────────────────
     base_weights = getattr(args, "base_weights", None)
-    if base_weights and Path(base_weights).exists():
-        print(f"\n[Fine-Tune] Loading baseline weights from {base_weights}...")
-        model.load_weights(str(base_weights))
-    elif getattr(args, "fine_tune", False):
-        print(f"\n[Fine-Tune] Loading existing weights from {output_path}...")
-        model.load_weights(str(output_path))
-        # Use a very low learning rate for fine-tuning
+
+    if args.fine_tune:
+        if not base_weights:
+            raise SystemExit(
+                "Error: --fine-tune requires --base-weights <model_path>"
+            )
+        if not Path(base_weights).exists():
+            raise SystemExit(
+                f"Error: Fine-tuning model not found: {base_weights}"
+            )
+
+        print(f"\n[Fine-Tune] Loading existing model from: {base_weights}")
+        model = keras.models.load_model(
+            str(base_weights),
+            compile=False,
+        )
+
+        # Freeze all layers first, then unfreeze only the final 10 layers.
+        for layer in model.layers:
+            layer.trainable = False
+        for layer in model.layers[-10:]:
+            layer.trainable = True
+
         config.learning_rate = 1e-5
-        print(f"[Fine-Tune] Setting learning rate to {config.learning_rate}")
+        trainable = sum(1 for layer in model.layers if layer.trainable)
+        total = len(model.layers)
+        print(f"[Fine-Tune] Total layers: {total}")
+        print(f"[Fine-Tune] Trainable layers: {trainable}")
+        print(f"[Fine-Tune] Frozen layers: {total - trainable}")
+        print(f"[Fine-Tune] Learning rate: {config.learning_rate}")
+    else:
+        print("\n[Training] Building a new U-Net from scratch...")
+        model = build_light_unet(
+            config.image_size,
+            config.base_filters,
+        )
 
     compile_model(model, config.learning_rate, config.loss_name)
 
@@ -189,8 +216,26 @@ def extract(args: argparse.Namespace) -> None:
     )
     weights = None if args.no_model else args.weights
     result = extract_roads(args.image, args.output, weights_path=weights, config=config)
-    print(f"Road extraction complete: {result['nodes']} nodes, {result['edges']} edges")
+    print("Geometry + topology extraction complete")
+    print(f"Input mask size: {result['input_mask_size']}")
+    print(f"Road pixels: {result['road_pixels']}")
+    print(f"Skeleton pixels: {result['skeleton_pixels']}")
+    print(f"Geometry connected components: {result['connected_components']}")
+    print(f"Geometry segments: {result['segments']}")
+    print(f"Total centerline length: {result['total_length_pixels']}")
+    print(f"Topology nodes: {result['topology_nodes']}")
+    print(f"Topology edges: {result['topology_edges']}")
+    print(f"Intersections: {result['topology_intersections']}")
+    print(f"Endpoints: {result['topology_endpoints']}")
+    print(f"Connected components: {result['topology_connected_components']}")
+    print(f"Suspicious/disconnected segments: {result['suspicious_disconnected_segments']}")
+    print("Major geometric changes:")
+    for key, value in result["major_geometric_changes"].items():
+        print(f"  {key}: {value}")
     print(f"Outputs written to: {result['output_dir']}")
+    print("Output files:")
+    for output_file in result["output_files"]:
+        print(f"  {output_file}")
 
 
 def evaluate_exp(args: argparse.Namespace) -> None:
@@ -272,7 +317,7 @@ def build_parser() -> argparse.ArgumentParser:
     extract_parser.add_argument("--weights", default=str(get_default_weights_path()), help="Path to U-Net model weights (defaults to occlusion-trained model)")
     extract_parser.add_argument("--no-model", action="store_true", help="Use classical fallback instead of model weights")
     extract_parser.add_argument("--image-size", type=int, default=256)
-    extract_parser.add_argument("--threshold", type=float, default=0.5)
+    extract_parser.add_argument("--threshold", type=float, default=0.30)
     extract_parser.add_argument("--min-object-size", type=int, default=64)
     extract_parser.add_argument("--closing-radius", type=int, default=3)
     extract_parser.add_argument("--bridge-kernel-size", type=int, default=9)

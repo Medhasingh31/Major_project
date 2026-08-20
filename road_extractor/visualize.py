@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 
 import cv2
 import numpy as np
@@ -16,6 +17,84 @@ def save_overlay(rgb: np.ndarray, mask: np.ndarray, path: str | Path) -> None:
     bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(path), bgr)
+
+
+def save_rgb_image(rgb: np.ndarray, path: str | Path) -> None:
+    """Save an RGB image using the repository's OpenCV BGR convention."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+
+
+def _draw_graph_edges(canvas: np.ndarray, graph, edge_color: tuple[int, int, int]) -> None:
+    """Draw graph edge pixel paths on an RGB canvas."""
+    for _, _, data in graph.edges(data=True):
+        try:
+            pixels = json.loads(data.get("pixels", "[]"))
+        except (TypeError, json.JSONDecodeError):
+            pixels = []
+        points = np.asarray(pixels, dtype=np.int32)
+        if len(points) >= 2:
+            cv2.polylines(
+                canvas,
+                [points.reshape(-1, 1, 2)],
+                isClosed=False,
+                color=edge_color,
+                thickness=2,
+            )
+
+
+def save_topology_overlay(
+    rgb: np.ndarray,
+    geometry,
+    topology,
+    path: str | Path,
+) -> None:
+    """Save centerlines, graph edges, endpoints, and junction markers."""
+    canvas = rgb.copy()
+    if geometry.skeleton is not None:
+        canvas[geometry.skeleton > 0] = np.array([80, 220, 220], dtype=np.uint8)
+
+    if topology.graph is not None:
+        # Blue = graph road edges; yellow = accepted gap bridges.
+        for _, _, data in topology.graph.edges(data=True):
+            color = (255, 180, 40) if data.get("edge_kind") == "geometry_bridge" else (40, 100, 255)
+            try:
+                pixels = json.loads(data.get("pixels", "[]"))
+            except (TypeError, json.JSONDecodeError):
+                pixels = []
+            points = np.asarray(pixels, dtype=np.int32)
+            if len(points) >= 2:
+                cv2.polylines(canvas, [points.reshape(-1, 1, 2)], False, color, 2)
+
+        for node_id, data in topology.graph.nodes(data=True):
+            center = (int(data["x"]), int(data["y"]))
+            kind = data.get("kind")
+            if kind == "endpoint":
+                color, radius = (40, 220, 40), 5       # green
+            elif kind == "junction":
+                color, radius = (255, 50, 50), 6       # red
+            else:
+                color, radius = (180, 180, 180), 3     # passthrough
+            cv2.circle(canvas, center, radius, color, -1 if kind != "junction" else 2)
+
+    save_rgb_image(canvas, path)
+
+
+def save_final_graph_overlay(
+    rgb: np.ndarray,
+    graph,
+    path: str | Path,
+) -> None:
+    """Save the final exported graph with distinct edge/node markers."""
+    canvas = rgb.copy()
+    if graph is not None:
+        _draw_graph_edges(canvas, graph, (40, 100, 255))
+        for _, data in graph.nodes(data=True):
+            kind = data.get("kind")
+            color = (40, 220, 40) if kind == "endpoint" else (255, 50, 50)
+            radius = 5 if kind == "endpoint" else 6
+            cv2.circle(canvas, (int(data["x"]), int(data["y"])), radius, color, -1)
+    save_rgb_image(canvas, path)
 
 
 def save_graph_plot(graph, path: str | Path, image_shape: tuple[int, int]) -> None:

@@ -2,61 +2,24 @@
 topology.py — Road Topology Module
 ====================================
 Independent layer over RoadGeometry. Does NOT touch the U-Net, its weights,
-training code, or inference code. The repaired_mask is used read-only as one
-of several evidence signals.
+training code, or inference code.
 
 INPUT
 -----
   geometry     : RoadGeometry  — output of geometry.extract_geometry()
-  repaired_mask: np.ndarray    — the cleaned binary road mask (H, W) uint8,
-                                 used as a segmentation-evidence signal only
 
 DESIGN PHILOSOPHY
 -----------------
-Two road segments should be connected only when MULTIPLE independent signals
-agree that a connection is plausible. A single signal (e.g. proximity) is
-never sufficient on its own.
-
-For every candidate endpoint-pair (one endpoint from segment A, one from
-segment B) the module computes seven independent sub-scores, each in [0, 1]:
-
-  S1  endpoint_distance   — Euclidean gap between the two endpoints.
-                            Short gaps score 1.0; gaps > max_gap_px score 0.0.
-
-  S2  direction_compat    — Orientation agreement between the two segments
-                            (road directions are undirected, so mod-180).
-                            Perfectly aligned = 1.0; ≥ 90° = 0.0.
-
-  S3  approach_align      — Local approach angle: do the *tail* vectors of
-                            both segments actually point toward each other?
-                            Uses the last few pixels of each path as a
-                            direction probe, clamped to [0, 1].
-
-  S4  mask_evidence       — Fraction of pixels along the straight-line probe
-                            between the two endpoints that are positive in
-                            the repaired_mask.  High fill = strong evidence
-                            the road exists in the gap.
-
-  S5  width_consistency   — How similar are the two segments' estimated road
-                            widths?  Identical widths = 1.0; large ratio = 0.0.
-
-  S6  centerline_continuity — How smoothly does a straight bridge between the
-                              endpoints fit the curvature of both segments?
-                              Low predicted bend = 1.0.
-
-  S7  gap_penalty         — Smooth decay over gap size relative to the mean
-                            width of the two segments.  A gap ≤ 1 × mean_width
-                            scores 1.0; beyond max_gap_px it scores 0.0.
-
-Weighted mean → connection_score ∈ [0, 1].
-An edge is created only when connection_score ≥ config.connection_threshold.
+Topology is a structural interpretation of Geometry. This foundation phase
+does not infer missing roads, does not use masks as evidence, and does not
+invent ground-truth topology. Nodes come from geometry endpoints and
+intersections; edges come from geometry road segments.
 
 DETECTED TOPOLOGY ELEMENTS
 ---------------------------
   • road endpoints       — degree-1 nodes (dead-ends / road tips)
   • intersections        — degree ≥ 3 nodes, classified T / X / Y / complex
-  • valid connections    — edges that passed the threshold (with score stored)
-  • rejected candidates  — endpoint pairs that were evaluated but failed
+  • valid connections    — geometry segments between endpoint/intersection nodes
   • disconnected segs    — segments whose both endpoints remain unconnected
 
 OUTPUT
@@ -73,7 +36,7 @@ OUTPUT
 
 PIPELINE POSITION
 -----------------
-  RoadGeometry + repaired_mask ──► topology.build_topology() ──► RoadTopology
+  RoadGeometry ──► topology.build_topology() ──► RoadTopology
                                                                         │
                                                                         ▼
                                                                confidence.score_topology()
@@ -111,7 +74,7 @@ class TopologyConfig:
     """
 
     # ── candidate search ──────────────────────────────────────────────────
-    max_gap_px: float = 40.0
+    max_gap_px: float = 18.0
     """Maximum Euclidean distance (pixels) between two endpoints to be
     considered as a connection candidate at all.  Pairs further apart are
     never evaluated, saving compute and preventing absurd bridges."""
@@ -153,6 +116,30 @@ class TopologyConfig:
     """Max direction difference for two segments sharing a node to be
     labelled a 'continuity link' (same physical road through junction)."""
 
+    node_snap_radius_px: float = 8.0
+    """Maximum distance for snapping a segment terminal to a geometry node."""
+
+    suspicious_short_segment_px: float = 12.0
+    """Flag isolated segments shorter than this as suspicious fragments."""
+
+    min_topology_edge_length_px: float = 3.0
+    """Reject only sub-pixel-contact-sized graph edges."""
+
+    tiny_edge_mask_support: float = 0.80
+    """Support required to retain an exceptionally short centerline edge."""
+
+    min_geometry_bridge_score: float = 0.74
+    """Minimum composite score for a geometry-only endpoint bridge."""
+
+    min_geometry_mask_support: float = 0.70
+    """Minimum clean-mask support along a proposed bridge."""
+
+    min_geometry_approach_alignment: float = 0.72
+    """Minimum opposing endpoint tangent alignment."""
+
+    min_geometry_continuity_score: float = 0.62
+    """Minimum local bend/continuity score for a proposed bridge."""
+
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -183,6 +170,12 @@ class Connection:
     node_a: int = -1
     node_b: int = -1
 
+    # Phase 13 decision diagnostics. These are topology-summary metadata;
+    # graph/export schemas are unchanged.
+    evidence_count: int = 0
+    evidence_required: int = 0
+    decision_reasons: list[str] = field(default_factory=list)
+
     def to_dict(self) -> dict:
         return {
             "seg_a": self.seg_a,
@@ -193,6 +186,11 @@ class Connection:
             "gap_px": round(self.gap_px, 2),
             "accepted": self.accepted,
             "signals": {k: round(v, 4) for k, v in self.signals.items()},
+            "diagnostics": {
+                "evidence_count": self.evidence_count,
+                "evidence_required": self.evidence_required,
+                "reasons": list(self.decision_reasons),
+            },
         }
 
 
@@ -619,6 +617,297 @@ def _segment_endpoints(seg: RoadSegment) -> list[tuple[int, int]]:
     return [seg.pixel_path[0], seg.pixel_path[-1]]
 
 
+def _point_distance(a: tuple[int, int], b: tuple[int, int]) -> float:
+    dy = float(a[0] - b[0])
+    dx = float(a[1] - b[1])
+    return math.sqrt(dy * dy + dx * dx)
+
+
+def _nearest_node(
+    point: tuple[int, int],
+    node_points: dict[int, tuple[int, int]],
+    max_distance: float,
+) -> tuple[Optional[int], float]:
+    best_node: Optional[int] = None
+    best_distance = float("inf")
+    for node_id, node_point in node_points.items():
+        distance = _point_distance(point, node_point)
+        if distance < best_distance:
+            best_node = node_id
+            best_distance = distance
+    if best_node is None or best_distance > max_distance:
+        return None, best_distance
+    return best_node, best_distance
+
+
+def _add_geometry_node(
+    graph: "nx.Graph",
+    node_points: dict[int, tuple[int, int]],
+    point: tuple[int, int],
+    kind: str,
+    node_id: int,
+) -> int:
+    y, x = point
+    graph.add_node(node_id, y=int(y), x=int(x), kind=kind)
+    node_points[node_id] = (int(y), int(x))
+    return node_id + 1
+
+
+def _build_geometry_graph(
+    geometry: RoadGeometry,
+    cfg: TopologyConfig,
+) -> tuple["nx.Graph", dict[tuple[int, int], int], list[int]]:
+    """
+    Build a NetworkX graph strictly from RoadGeometry.
+
+    Nodes are geometry endpoints and junction/intersection representatives.
+    Edges are geometry segments snapped to those nodes. No inferred bridge
+    edges are created here.
+    """
+    if not _HAS_NX:
+        raise ImportError(
+            "networkx is required for topology.build_topology(). "
+            "Install it with: pip install networkx"
+        )
+
+    graph = nx.Graph()
+    graph.graph["duplicate_edges_removed"] = 0
+    graph.graph["tiny_edges_removed"] = 0
+    graph.graph["self_loop_edges_removed"] = 0
+    node_points: dict[int, tuple[int, int]] = {}
+    pixel_to_node: dict[tuple[int, int], int] = {}
+    next_node_id = 0
+
+    for point in sorted(set(geometry.endpoints)):
+        next_node_id = _add_geometry_node(
+            graph,
+            node_points,
+            point,
+            kind="endpoint",
+            node_id=next_node_id,
+        )
+        pixel_to_node[point] = next_node_id - 1
+
+    for point in sorted(set(geometry.junctions)):
+        if point in pixel_to_node:
+            graph.nodes[pixel_to_node[point]]["kind"] = "junction"
+            continue
+        next_node_id = _add_geometry_node(
+            graph,
+            node_points,
+            point,
+            kind="junction",
+            node_id=next_node_id,
+        )
+        pixel_to_node[point] = next_node_id - 1
+
+    suspicious_segments: list[int] = []
+
+    for seg in geometry.segments:
+        if len(seg.pixel_path) < 2:
+            suspicious_segments.append(seg.segment_id)
+            continue
+
+        if seg.length_pixels < cfg.min_topology_edge_length_px:
+            support = 0.0
+            if geometry.clean_mask is not None:
+                support = float(np.mean([
+                    geometry.clean_mask[y, x] > 0
+                    for y, x in seg.pixel_path
+                    if 0 <= y < geometry.clean_mask.shape[0]
+                    and 0 <= x < geometry.clean_mask.shape[1]
+                ]))
+            if support < cfg.tiny_edge_mask_support:
+                suspicious_segments.append(seg.segment_id)
+                graph.graph["tiny_edges_removed"] += 1
+                continue
+
+        start_px, end_px = _segment_endpoints(seg)
+        start_node, start_snap = _nearest_node(
+            start_px,
+            node_points,
+            cfg.node_snap_radius_px,
+        )
+        end_node, end_snap = _nearest_node(
+            end_px,
+            node_points,
+            cfg.node_snap_radius_px,
+        )
+
+        if start_node is None:
+            next_node_id = _add_geometry_node(
+                graph,
+                node_points,
+                start_px,
+                kind="endpoint",
+                node_id=next_node_id,
+            )
+            start_node = next_node_id - 1
+            pixel_to_node[start_px] = start_node
+            start_snap = 0.0
+
+        if end_node is None:
+            next_node_id = _add_geometry_node(
+                graph,
+                node_points,
+                end_px,
+                kind="endpoint",
+                node_id=next_node_id,
+            )
+            end_node = next_node_id - 1
+            pixel_to_node[end_px] = end_node
+            end_snap = 0.0
+
+        if start_node == end_node:
+            suspicious_segments.append(seg.segment_id)
+            graph.graph["self_loop_edges_removed"] += 1
+            continue
+
+        edge_data = {
+            "segment_id": seg.segment_id,
+            "length_pixels": seg.length_pixels,
+            "direction_deg": seg.direction_deg,
+            "curvature": seg.curvature,
+            "width_pixels": seg.width_pixels,
+            "gap_px": 0.0,
+            "connection_score": 1.0,
+            "edge_kind": "geometry_segment",
+            "start_snap_px": round(float(start_snap), 3),
+            "end_snap_px": round(float(end_snap), 3),
+        }
+        if graph.has_edge(start_node, end_node):
+            existing = graph.edges[start_node, end_node]
+            existing_quality = (
+                float(existing.get("length_pixels", 0.0)),
+                float(existing.get("width_pixels", 0.0)),
+            )
+            new_quality = (float(seg.length_pixels), float(seg.width_pixels))
+            suspicious_segments.append(seg.segment_id)
+            graph.graph["duplicate_edges_removed"] += 1
+            if new_quality > existing_quality:
+                old_segment = int(existing.get("segment_id", -1))
+                if old_segment >= 0:
+                    suspicious_segments.append(old_segment)
+                graph.remove_edge(start_node, end_node)
+            else:
+                continue
+
+        graph.add_edge(
+            start_node,
+            end_node,
+            **edge_data,
+        )
+
+    return graph, pixel_to_node, sorted(set(suspicious_segments))
+
+
+def _add_conservative_geometry_connections(
+    graph: "nx.Graph",
+    geometry: RoadGeometry,
+    cfg: TopologyConfig,
+) -> tuple[list[Connection], list[Connection]]:
+    """Add only well-supported bridges between currently terminal nodes.
+
+    This uses Geometry's cleaned mask as the nearby-road evidence source. It
+    never joins a junction node, never joins two endpoints from one segment,
+    and greedily accepts each endpoint at most once.
+    """
+    if geometry.clean_mask is None:
+        return [], []
+
+    endpoint_records: list[tuple[RoadSegment, tuple[int, int], int]] = []
+    for segment in geometry.segments:
+        for endpoint in _segment_endpoints(segment):
+            candidates = [
+                node_id
+                for node_id, data in graph.nodes(data=True)
+                if data.get("kind") == "endpoint"
+                and _point_distance(endpoint, (data["y"], data["x"])) <= cfg.node_snap_radius_px
+            ]
+            if not candidates:
+                continue
+            node_id = min(
+                candidates,
+                key=lambda candidate: _point_distance(
+                    endpoint,
+                    (graph.nodes[candidate]["y"], graph.nodes[candidate]["x"]),
+                ),
+            )
+            if graph.degree(node_id) == 1:
+                endpoint_records.append((segment, endpoint, int(node_id)))
+
+    candidates: list[tuple[Connection, int, int]] = []
+    rejected: list[Connection] = []
+    for index, (seg_a, end_a, node_a) in enumerate(endpoint_records):
+        for seg_b, end_b, node_b in endpoint_records[index + 1:]:
+            if seg_a.segment_id == seg_b.segment_id or node_a == node_b:
+                continue
+            gap = _point_distance(end_a, end_b)
+            if gap < 1.5 or gap > cfg.max_gap_px:
+                continue
+            candidate = _score_candidate(
+                seg_a,
+                end_a,
+                seg_b,
+                end_b,
+                geometry.clean_mask,
+                cfg,
+            )
+            accepted_by_evidence, reasons, evidence_count, evidence_required = _evaluate_multi_evidence(
+                candidate, cfg
+            )
+            candidate.evidence_count = evidence_count
+            candidate.evidence_required = evidence_required
+            candidate.decision_reasons = reasons
+            if not accepted_by_evidence:
+                rejected.append(candidate)
+                continue
+            candidates.append((candidate, node_a, node_b))
+
+    candidates.sort(key=lambda item: item[0].score, reverse=True)
+    accepted: list[Connection] = []
+    matched_nodes: set[int] = set()
+    for candidate, node_a, node_b in candidates:
+        if node_a in matched_nodes or node_b in matched_nodes:
+            candidate.decision_reasons = [
+                "rejected after ranking because one endpoint was already matched"
+            ]
+            rejected.append(candidate)
+            continue
+        if graph.has_edge(node_a, node_b):
+            candidate.decision_reasons = [
+                "rejected because the graph already contains this edge"
+            ]
+            rejected.append(candidate)
+            continue
+
+        candidate.accepted = True
+        if not candidate.decision_reasons:
+            candidate.decision_reasons = ["accepted by multi-evidence gate"]
+        candidate.node_a = node_a
+        candidate.node_b = node_b
+        matched_nodes.update((node_a, node_b))
+        graph.add_edge(
+            node_a,
+            node_b,
+            segment_id=-1,
+            length_pixels=candidate.gap_px,
+            direction_deg=-1.0,
+            curvature=0.0,
+            width_pixels=0.0,
+            gap_px=candidate.gap_px,
+            connection_score=candidate.score,
+            edge_kind="geometry_bridge",
+            pixels=json.dumps([
+                [int(candidate.end_a[1]), int(candidate.end_a[0])],
+                [int(candidate.end_b[1]), int(candidate.end_b[0])],
+            ]),
+        )
+        accepted.append(candidate)
+
+    return accepted, rejected
+
+
 # ---------------------------------------------------------------------------
 # Graph construction
 # ---------------------------------------------------------------------------
@@ -797,13 +1086,25 @@ def _detect_intersections(
 ) -> list[Intersection]:
     intersections: list[Intersection] = []
     for node_id, data in G.nodes(data=True):
-        degree = G.degree(node_id)
+        # A topology intersection must originate from Geometry's explicit
+        # junction classification.  Do not promote an endpoint node merely
+        # because a later bridge or incidental graph edge raises its degree.
+        if data.get("kind") != "junction":
+            continue
+        geometry_edges = [
+            edata
+            for _, _, edata in G.edges(node_id, data=True)
+            if edata.get("edge_kind") in {"geometry_segment", "skeleton"}
+            and edata.get("segment_id", -1) >= 0
+        ]
+        if len(geometry_edges) < 3:
+            continue
+        degree = len(geometry_edges)
         kind = _classify_kind(degree)
         y, x = data["y"], data["x"]
         incident_seg_ids = [
             edata["segment_id"]
-            for _, _, edata in G.edges(node_id, data=True)
-            if edata.get("segment_id", -1) >= 0
+            for edata in geometry_edges
         ]
         intersections.append(
             Intersection(
@@ -838,7 +1139,8 @@ def _find_continuity_links(
         incident = [
             (u, v, d)
             for u, v, d in G.edges(node_id, data=True)
-            if d.get("edge_kind") == "skeleton" and d.get("segment_id", -1) >= 0
+            if d.get("edge_kind") in {"skeleton", "geometry_segment"}
+            and d.get("segment_id", -1) >= 0
         ]
         if len(incident) < 2:
             continue
@@ -881,16 +1183,175 @@ def _find_disconnected_segments(
     These are isolated road fragments worth flagging.
     """
     isolated: list[int] = []
-    for seg in geometry.segments:
-        endpoints = _segment_endpoints(seg)
-        degrees = []
-        for ep in endpoints:
-            n = pixel_to_node.get(ep)
-            if n is not None:
-                degrees.append(G.degree(n))
-        if degrees and all(d <= 1 for d in degrees):
-            isolated.append(seg.segment_id)
+    component_by_node: dict[int, int] = {}
+    for idx, component in enumerate(nx.connected_components(G)):
+        for node_id in component:
+            component_by_node[int(node_id)] = idx
+
+    component_edge_counts: dict[int, int] = {}
+    for u, v in G.edges():
+        component_id = component_by_node.get(int(u))
+        if component_id is None:
+            continue
+        component_edge_counts[component_id] = component_edge_counts.get(component_id, 0) + 1
+
+    for u, v, data in G.edges(data=True):
+        segment_id = data.get("segment_id", -1)
+        if segment_id < 0:
+            continue
+        component_id = component_by_node.get(int(u))
+        if component_id is not None and component_edge_counts.get(component_id, 0) == 1:
+            isolated.append(int(segment_id))
     return isolated
+
+
+def _evaluate_multi_evidence(
+    candidate: Connection,
+    cfg: TopologyConfig,
+) -> tuple[bool, list[str], int, int]:
+    """Require independent evidence channels before adding a bridge."""
+    signals = candidate.signals
+    strong = {
+        "endpoint_distance": signals["endpoint_distance"] >= 0.85,
+        "direction_compat": signals["direction_compat"] >= 0.80,
+        "approach_align": signals["approach_align"] >= cfg.min_geometry_approach_alignment,
+        "centerline_continuity": signals["centerline_continuity"] >= cfg.min_geometry_continuity_score,
+        "mask_evidence": signals["mask_evidence"] >= cfg.min_geometry_mask_support,
+        "width_consistency": signals["width_consistency"] >= 0.80,
+    }
+    geometric_names = (
+        "endpoint_distance", "direction_compat", "approach_align",
+        "centerline_continuity", "width_consistency",
+    )
+    geometry_count = sum(strong[name] for name in geometric_names)
+    evidence_count = sum(strong.values())
+    evidence_required = 5  # mask + four of five geometric signals
+    reasons: list[str] = []
+    if not strong["mask_evidence"]:
+        reasons.append(
+            f"mask support {signals['mask_evidence']:.2f} is below the unchanged "
+            f"{cfg.min_geometry_mask_support:.2f} minimum"
+        )
+    if geometry_count < 4:
+        weak = [name for name in geometric_names if not strong[name]]
+        reasons.append(f"only {geometry_count}/5 geometric signals are strong; weak={','.join(weak)}")
+    if not strong["approach_align"]:
+        reasons.append("opposing approach-angle safety floor failed")
+    if not strong["centerline_continuity"]:
+        reasons.append("centerline bend/continuity safety floor failed")
+    if candidate.score < cfg.min_geometry_bridge_score:
+        reasons.append(
+            f"composite score {candidate.score:.2f} is below {cfg.min_geometry_bridge_score:.2f}"
+        )
+    accepted = (
+        candidate.score >= cfg.min_geometry_bridge_score
+        and strong["mask_evidence"]
+        and geometry_count >= 4
+        and strong["approach_align"]
+        and strong["centerline_continuity"]
+    )
+    if accepted:
+        reasons = [
+            f"accepted with {evidence_count}/{evidence_required} strong evidence channels",
+            "mask support independently confirms the geometric continuation",
+        ]
+    return accepted, reasons, evidence_count, evidence_required
+
+
+def _connectivity_diagnostics(
+    graph: "nx.Graph",
+    intersections: list[Intersection],
+    rejected_connections: list[Connection],
+    cfg: TopologyConfig,
+) -> dict:
+    """Summarize graph connectivity without forcing components together."""
+    components = [sorted(int(node) for node in component) for component in nx.connected_components(graph)]
+    very_short_edges: list[dict] = []
+    suspicious_connections: list[dict] = []
+    for u, v, data in graph.edges(data=True):
+        length = float(data.get("length_pixels", 0.0))
+        if length < cfg.suspicious_short_segment_px:
+            very_short_edges.append({
+                "source": int(u),
+                "target": int(v),
+                "length_pixels": round(length, 3),
+                "edge_kind": data.get("edge_kind", "unknown"),
+                "segment_id": int(data.get("segment_id", -1)),
+            })
+        if data.get("edge_kind") == "geometry_bridge":
+            score = float(data.get("connection_score", 0.0))
+            if score < cfg.min_geometry_bridge_score + 0.08:
+                suspicious_connections.append({
+                    "source": int(u),
+                    "target": int(v),
+                    "score": round(score, 4),
+                    "gap_pixels": round(float(data.get("gap_px", 0.0)), 3),
+                    "reason": "accepted bridge is close to the confidence floor",
+                })
+
+    suspicious_components = []
+    for component_id, component in enumerate(components):
+        edge_count = sum(
+            1
+            for u, v in graph.edges(component)
+            if u in component and v in component
+        )
+        if edge_count == 0:
+            suspicious_components.append({
+                "component_id": component_id,
+                "nodes": component,
+                "edge_count": 0,
+                "reason": "isolated node component",
+            })
+
+    return {
+        "total_nodes": int(graph.number_of_nodes()),
+        "total_edges": int(graph.number_of_edges()),
+        "intersections": int(len(intersections)),
+        "endpoints": int(sum(1 for node in graph.nodes() if graph.degree(node) == 1)),
+        "connected_components": int(len(components)),
+        "isolated_nodes": int(sum(1 for node in graph.nodes() if graph.degree(node) == 0)),
+        "very_short_edges": very_short_edges,
+        "very_short_edge_count": int(len(very_short_edges)),
+        "suspicious_connections": suspicious_connections,
+        "suspicious_connection_count": int(
+            len(suspicious_connections) + len(rejected_connections)
+        ),
+        "rejected_connection_count": int(len(rejected_connections)),
+        "suspicious_disconnected_components": suspicious_components,
+        "separate_components_preserved": True,
+    }
+
+
+def _cleanup_graph_for_export(graph: "nx.Graph") -> dict:
+    """Remove invalid graph artifacts while preserving real components."""
+    removed_self_loops = 0
+    for u, v in list(nx.selfloop_edges(graph)):
+        graph.remove_edge(u, v)
+        removed_self_loops += 1
+
+    removed_isolated_nodes = 0
+    for node_id in list(graph.nodes()):
+        if graph.degree(node_id) == 0:
+            graph.remove_node(node_id)
+            removed_isolated_nodes += 1
+
+    accidental_junctions: list[int] = []
+    for node_id, data in graph.nodes(data=True):
+        if data.get("kind") == "junction" and graph.degree(node_id) < 3:
+            # Keep the segmentation point for edge bookkeeping, but do not
+            # export it as an intersection/network event.
+            data["kind"] = "passthrough"
+            accidental_junctions.append(int(node_id))
+
+    return {
+        "isolated_nodes_removed": removed_isolated_nodes,
+        "self_loop_edges_removed": removed_self_loops,
+        "accidental_junctions_flagged": accidental_junctions,
+        "duplicate_edges_removed": int(graph.graph.get("duplicate_edges_removed", 0)),
+        "tiny_edges_removed": int(graph.graph.get("tiny_edges_removed", 0)),
+        "real_components_preserved": True,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -899,25 +1360,24 @@ def _find_disconnected_segments(
 
 def build_topology(
     geometry: RoadGeometry,
-    repaired_mask: np.ndarray,
+    repaired_mask: Optional[np.ndarray] = None,
     config: Optional[TopologyConfig] = None,
 ) -> RoadTopology:
     """
     Main entry point for the Topology module.
 
-    Independently evaluates every pair of nearby segment endpoints using
-    seven geometric and mask-based signals.  An edge is added to the road
-    network graph only when the weighted composite score meets the
-    configurable threshold.
+    Builds a topology graph strictly from RoadGeometry. Nodes come from
+    geometry endpoints and intersections; edges come from geometry road
+    segments plus conservative bridges supported by Geometry's clean mask.
+    The repaired_mask parameter is accepted for backward compatibility but is
+    intentionally ignored in this phase.
 
     Parameters
     ----------
     geometry : RoadGeometry
         Output of geometry.extract_geometry().
     repaired_mask : np.ndarray
-        Binary road mask, shape (H, W), dtype uint8 (values 0 or 1).
-        Treated READ-ONLY — used only as evidence for signal S4.
-        Must be the same mask that was passed to extract_geometry().
+        Ignored. Topology foundation uses RoadGeometry as its only input.
     config : TopologyConfig | None
         Tuning parameters.  Uses defaults when None.
 
@@ -938,14 +1398,16 @@ def build_topology(
         )
 
     # ------------------------------------------------------------------
-    # 1. Build the scored graph (skeleton edges + accepted bridge edges)
+    # 1. Build the graph from geometry nodes and geometry segments only
     # ------------------------------------------------------------------
-    G, accepted, rejected, pixel_to_node = _build_scored_graph(
-        geometry, repaired_mask, cfg
+    G, pixel_to_node, suspicious = _build_geometry_graph(geometry, cfg)
+    accepted_connections, rejected_connections = _add_conservative_geometry_connections(
+        G, geometry, cfg
     )
+    cleanup = _cleanup_graph_for_export(G)
 
     # ------------------------------------------------------------------
-    # 2. Classify every node as an intersection type
+    # 2. Classify intersection nodes
     # ------------------------------------------------------------------
     intersections = _detect_intersections(G, geometry)
 
@@ -959,7 +1421,9 @@ def build_topology(
     # ------------------------------------------------------------------
     # 4. Find isolated (disconnected) segments
     # ------------------------------------------------------------------
-    disconnected = _find_disconnected_segments(geometry, G, pixel_to_node)
+    disconnected = sorted(
+        set(_find_disconnected_segments(geometry, G, pixel_to_node)) | set(suspicious)
+    )
 
     # ------------------------------------------------------------------
     # 5. Connected components
@@ -973,33 +1437,53 @@ def build_topology(
     # 6. Assemble metadata
     # ------------------------------------------------------------------
     signal_stats: dict[str, float] = {}
-    all_conns = accepted + rejected
-    if all_conns:
-        for sig_name in all_conns[0].signals:
-            vals = [c.signals[sig_name] for c in all_conns]
-            signal_stats[f"mean_{sig_name}"] = round(float(np.mean(vals)), 4)
+    endpoint_nodes = [
+        node_id for node_id in G.nodes()
+        if G.degree(node_id) == 1
+    ]
+    isolated_nodes = [
+        node_id for node_id in G.nodes()
+        if G.degree(node_id) == 0
+    ]
+    connectivity = _connectivity_diagnostics(
+        G,
+        intersections,
+        rejected_connections,
+        cfg,
+    )
 
     metadata = {
         "node_count":            G.number_of_nodes(),
         "edge_count":            G.number_of_edges(),
         "skeleton_edges":        sum(
-            1 for _, _, d in G.edges(data=True) if d.get("edge_kind") == "skeleton"
+            1
+            for _, _, d in G.edges(data=True)
+            if d.get("edge_kind") == "geometry_segment"
         ),
-        "bridge_edges":          len(accepted),
-        "rejected_candidates":   len(rejected),
-        "disconnected_segments": len(disconnected),
+        "duplicate_edges_removed": int(G.graph.get("duplicate_edges_removed", 0)),
+        "tiny_edges_removed":      int(G.graph.get("tiny_edges_removed", 0)),
+        "self_loop_edges_removed": int(G.graph.get("self_loop_edges_removed", 0)),
+        "bridge_edges":          len(accepted_connections),
+        "rejected_candidates":   len(rejected_connections),
+        "intersection_count":    len(intersections),
+        "endpoint_count":        len(endpoint_nodes),
+        "isolated_node_count":   len(isolated_nodes),
+        "disconnected_segment_count": len(disconnected),
+        "suspicious_segments":   disconnected,
         "component_count":       len(components),
-        "connection_threshold":  cfg.connection_threshold,
-        "max_gap_px":            cfg.max_gap_px,
+        "node_snap_radius_px":   cfg.node_snap_radius_px,
+        "bridge_max_gap_px":     cfg.max_gap_px,
         "signal_stats":          signal_stats,
+        "connectivity_validation": connectivity,
+        "graph_cleanup": cleanup,
     }
 
     return RoadTopology(
         graph=G,
         intersections=intersections,
         continuity_links=continuity_links,
-        connections=accepted,
-        rejected=rejected,
+        connections=accepted_connections,
+        rejected=rejected_connections,
         disconnected_segs=disconnected,
         components=components,
         metadata=metadata,

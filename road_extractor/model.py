@@ -96,23 +96,18 @@ def dice_loss(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
 
 
 def combined_loss(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
-    """
-    Combined Dice + Binary Cross-Entropy loss (equal weighting).
+     """
+     Weighted Dice + Binary Cross-Entropy loss.
 
-    Rationale for DeepGlobe roads (~5% road pixels):
-      - BCE alone: gradients dominated by easy background pixels; road recall suffers.
-      - Dice alone: insensitive to absolute pixel counts; misses fine calibration.
-      - Combined: Dice drives overlap (handles imbalance); BCE anchors pixel-level
-        probability calibration.  Sum of both is a standard best practice for
-        road/vessel segmentation on imbalanced datasets.
+     Gives more importance to Dice overlap, which is useful for
+     highly imbalanced road/background segmentation.
+     """
+     bce = tf.keras.losses.binary_crossentropy(y_true, y_pred)
+     bce = tf.reduce_mean(bce)
 
-    Both terms are in [0, 1], so the combined loss is in [0, 2].
-    Keras logs it as-is; lower is better.
-    """
-    bce = tf.keras.losses.binary_crossentropy(y_true, y_pred)
-    bce = tf.reduce_mean(bce)
-    return dice_loss(y_true, y_pred) + bce
+     dice = dice_loss(y_true, y_pred)
 
+     return 2.0 * dice + bce
 
 # ---------------------------------------------------------------------------
 # Model compilation

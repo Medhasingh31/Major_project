@@ -314,22 +314,27 @@
                 <p>The continuous binary mask is eroded down to a pristine, one-pixel-wide centerline. This perfectly preserves the topology required for the final graph generation.</p>
             </div>
             <div class="step-image">
-                <img src="/{{ output_dir }}/skeleton.png?t={{ range(1, 1000000) | random }}" alt="Skeleton">
+                <img src="/{{ output_dir }}/geometry_skeleton.png?t={{ range(1, 1000000) | random }}" alt="Geometry skeleton">
             </div>
         </div>
 
         <div class="step-row glass-panel">
             <div class="step-info">
                 <h2><span style="opacity:0.5">05 //</span> Topological Graph</h2>
-                <p>The mathematical network representation overlayed onto the original image. Intersections are mapped as nodes (red) and roads as edges (blue) using NetworkX.</p>
+                <p>The mathematical network representation overlaid onto the original image. Road endpoints and junction/intersection points are represented as nodes, while road segments are represented as edges using NetworkX.</p>
                 <div class="stats">
                     <strong>Network Metrics Captured:</strong><br>
-                    Junction Nodes: {{ nodes }}<br>
-                    Traversable Edges: {{ edges }}
+                    Nodes: {{ nodes }}<br>
+                    Road Segments (Edges): {{ edges }}<br>
+                    Intersections/Junctions: {{ intersections }}<br>
+                    Endpoints: {{ endpoints }}<br>
+                    Connected Components: {{ components }}<br>
+                    GeoJSON: {{ geojson_path }}<br>
+                    GraphML: {{ graphml_path }}
                 </div>
             </div>
             <div class="step-image">
-                <img src="/{{ output_dir }}/graph_plot.png?t={{ range(1, 1000000) | random }}" alt="Graph Plot">
+                <img src="/{{ output_dir }}/geometry_diagnostic.png?t={{ range(1, 1000000) | random }}" alt="Geometry and topology diagnostic">
             </div>
         </div>
 

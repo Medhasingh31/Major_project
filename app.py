@@ -43,7 +43,7 @@ def process():
     weights = str(weights_path) if weights_path.exists() else None
     
     # 4. Run the Pipeline
-    # This dynamically generates raw_mask.png, repaired_mask.png, skeleton.png, graph_plot.png
+    # This generates the masks, geometry diagnostics, and exported road graph.
     result = extract_roads(
         image_path=upload_path,
         output_dir=output_dir,
@@ -55,8 +55,13 @@ def process():
     # The frontend will read the images directly from the static/outputs/run/ directory
     return render_template('index.html', 
                            processed=True,
-                           nodes=result['nodes'],
-                           edges=result['edges'],
+                           nodes=result['topology_nodes'],
+                           edges=result['topology_edges'],
+                           intersections=result['topology_intersections'],
+                           endpoints=result['topology_endpoints'],
+                           components=result['topology_connected_components'],
+                           geojson_path=result['geojson_path'],
+                           graphml_path=result['graphml_path'],
                            upload_path=upload_path.replace('\\', '/'),
                            output_dir=output_dir.replace('\\', '/'))
 

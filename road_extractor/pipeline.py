@@ -1,13 +1,51 @@
 from pathlib import Path
+import json
 
 import cv2
 import numpy as np
 
 from road_extractor.config import ExtractionConfig
 from road_extractor.data import read_rgb, resize_image
-from road_extractor.graph import export_geojson, export_graphml, skeleton_to_graph
-from road_extractor.postprocess import classical_road_candidate_mask, repair_road_mask, skeletonize_mask
-from road_extractor.visualize import save_graph_plot, save_mask, save_overlay, save_pipeline_summary_plot
+from road_extractor.geometry import (
+    GeometryConfig,
+    extract_geometry,
+    extract_skeleton,
+    save_clean_mask_image,
+    save_geometry_diagnostic,
+    save_geometry_json,
+    save_skeleton_image,
+)
+from road_extractor.graph import export_geojson, export_graphml
+from road_extractor.postprocess import classical_road_candidate_mask, repair_road_mask
+from road_extractor.topology import build_topology, save_topology_json
+from road_extractor.visualize import (
+    save_final_graph_overlay,
+    save_mask,
+    save_overlay,
+    save_rgb_image,
+    save_topology_overlay,
+)
+
+
+def _prepare_graph_exports(topology, geometry) -> None:
+    """Attach Geometry paths to the Topology graph for the existing exporters."""
+    if topology.graph is None:
+        return
+
+    segments = {segment.segment_id: segment for segment in geometry.segments}
+    for source, target, data in topology.graph.edges(data=True):
+        segment = segments.get(data.get("segment_id"))
+        if segment is None:
+            # Topology foundation currently creates no bridge edges, but keep
+            # the adapter valid if that changes in a later phase.
+            if "pixels" not in data:
+                data["pixels"] = json.dumps([])
+            data["length"] = int(round(float(data.get("length_pixels", 0.0))))
+            continue
+        data["pixels"] = json.dumps(
+            [[int(x), int(y)] for y, x in segment.pixel_path]
+        )
+        data["length"] = int(round(float(segment.length_pixels)))
 
 
 def _predict_single_frame_tta(model, image_norm: np.ndarray) -> np.ndarray:
@@ -155,20 +193,91 @@ def extract_roads(
         closing_radius=config.closing_radius,
         bridge_kernel_size=config.bridge_kernel_size,
     )
-    skeleton = skeletonize_mask(repaired_mask)
-    graph = skeleton_to_graph(skeleton)
+    geometry = extract_geometry(
+        image,
+        repaired_mask,
+        config=GeometryConfig(
+            min_road_area_px=config.min_object_size,
+            morphology_close_radius=config.closing_radius,
+        ),
+    )
+    topology = build_topology(geometry)
+    _prepare_graph_exports(topology, geometry)
+    raw_skeleton = extract_skeleton(geometry.clean_mask) if geometry.clean_mask is not None else np.zeros_like(repaired_mask)
 
+    save_rgb_image(image, output_dir / "original_rgb.png")
     save_mask(raw_mask, output_dir / "raw_mask.png")
     save_mask(repaired_mask, output_dir / "repaired_mask.png")
-    save_mask(skeleton, output_dir / "skeleton.png")
+    save_clean_mask_image(geometry, output_dir / "geometry_clean_mask.png")
+    save_mask(raw_skeleton, output_dir / "raw_skeleton.png")
+    save_skeleton_image(geometry, output_dir / "geometry_skeleton.png")
     save_overlay(image, repaired_mask, output_dir / "overlay.png")
-    save_graph_plot(graph, output_dir / "graph_plot.png", image.shape[:2])
-    save_pipeline_summary_plot(image, raw_mask, repaired_mask, skeleton, graph, output_dir / "pipeline_summary.png")
-    export_graphml(graph, output_dir / "road_graph.graphml")
-    export_geojson(graph, output_dir / "road_graph.geojson")
+    save_geometry_diagnostic(image, geometry, output_dir / "geometry_diagnostic.png")
+    save_topology_overlay(image, geometry, topology, output_dir / "topology_overlay.png")
+    save_final_graph_overlay(image, topology.graph, output_dir / "road_graph.png")
+    save_geometry_json(geometry, output_dir / "geometry_summary.json")
+    save_topology_json(topology, output_dir / "topology_summary.json")
+    geojson_path = output_dir / "road_network.geojson"
+    graphml_path = output_dir / "road_network.graphml"
+    export_geojson(topology.graph, geojson_path)
+    export_graphml(topology.graph, graphml_path)
+
+    output_files = [
+        "original_rgb.png",
+        "raw_mask.png",
+        "repaired_mask.png",
+        "geometry_clean_mask.png",
+        "raw_skeleton.png",
+        "geometry_skeleton.png",
+        "overlay.png",
+        "geometry_diagnostic.png",
+        "topology_overlay.png",
+        "road_graph.png",
+        "geometry_summary.json",
+        "topology_summary.json",
+        "road_network.geojson",
+        "road_network.graphml",
+    ]
+    metadata = geometry.metadata
+    topology_metadata = topology.metadata
 
     return {
-        "nodes": graph.number_of_nodes(),
-        "edges": graph.number_of_edges(),
+        "input_mask_size": metadata["input_mask_shape"],
+        "road_pixels": metadata["input_road_pixels"],
+        "skeleton_pixels": metadata["pruned_skeleton_pixels"],
+        "connected_components": metadata["skeleton_connected_components"],
+        "segments": geometry.segment_count(),
+        "junctions": geometry.junction_count(),
+        "endpoints": len(geometry.endpoints),
+        "total_length_pixels": round(geometry.total_length(), 2),
+        "topology_nodes": topology.node_count(),
+        "topology_edges": topology.edge_count(),
+        "topology_bridge_edges": topology_metadata["bridge_edges"],
+        "topology_intersections": topology_metadata["intersection_count"],
+        "topology_endpoints": topology_metadata["endpoint_count"],
+        "topology_connected_components": topology_metadata["component_count"],
+        "quantitative_metrics": {
+            "road_pixels": int(metadata["input_road_pixels"]),
+            "skeleton_pixels": int(metadata["pruned_skeleton_pixels"]),
+            "connected_components": int(topology_metadata["component_count"]),
+            "endpoints": int(topology_metadata["endpoint_count"]),
+            "junctions_intersections": int(topology_metadata["intersection_count"]),
+            "edges": int(topology.edge_count()),
+            "suspicious_disconnected_segments": int(len(topology.disconnected_segs)),
+            "total_centerline_length": round(float(geometry.total_length()), 2),
+        },
+        "geojson_path": str(geojson_path),
+        "graphml_path": str(graphml_path),
+        "suspicious_disconnected_segments": topology.disconnected_segs,
+        "major_geometric_changes": {
+            "dead_end_spur_pixels_removed": metadata["dead_end_spur_pixels_removed"],
+            "small_component_pixels_removed": metadata["small_component_pixels_removed"],
+            "small_gaps_bridged": metadata["small_gaps_bridged"],
+            "junction_pixels_collapsed_to_junctions": [
+                metadata["junction_pixel_count"],
+                metadata["junction_count"],
+            ],
+        },
+        "output_files": [str(output_dir / name) for name in output_files],
         "output_dir": str(output_dir),
     }
