@@ -84,10 +84,27 @@ def repair_road_mask(
         selem = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
         closed = cv2.morphologyEx(binary.astype(np.uint8), cv2.MORPH_CLOSE, selem) > 0
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (bridge_kernel_size, 1))
-    horizontal = cv2.morphologyEx(closed.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
-    vertical = cv2.morphologyEx(closed.astype(np.uint8), cv2.MORPH_CLOSE, kernel.T)
-    repaired = np.logical_or(closed, np.logical_or(horizontal > 0, vertical > 0))
+    # Multi-angle directional line structuring elements (0, 90, 45, 135 degrees)
+    h_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (bridge_kernel_size, 1))
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, bridge_kernel_size))
+    
+    diag_size = max(3, bridge_kernel_size)
+    d1_kernel = np.eye(diag_size, dtype=np.uint8)
+    d2_kernel = np.fliplr(d1_kernel).astype(np.uint8)
+
+    closed_u8 = closed.astype(np.uint8)
+    horizontal = cv2.morphologyEx(closed_u8, cv2.MORPH_CLOSE, h_kernel)
+    vertical = cv2.morphologyEx(closed_u8, cv2.MORPH_CLOSE, v_kernel)
+    diag1 = cv2.morphologyEx(closed_u8, cv2.MORPH_CLOSE, d1_kernel)
+    diag2 = cv2.morphologyEx(closed_u8, cv2.MORPH_CLOSE, d2_kernel)
+
+    repaired = np.logical_or.reduce([
+        closed,
+        horizontal > 0,
+        vertical > 0,
+        diag1 > 0,
+        diag2 > 0
+    ])
 
     return repaired.astype(np.uint8)
 

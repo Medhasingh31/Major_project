@@ -40,7 +40,13 @@ def skeleton_to_graph(skeleton: np.ndarray) -> nx.Graph:
 
     for index, point in enumerate(sorted(important)):
         y, x = point
-        graph.add_node(index, y=int(y), x=int(x))
+        degree = len(_neighbor_pixels(y, x, skeleton))
+        graph.add_node(
+            index,
+            y=int(y),
+            x=int(x),
+            kind="endpoint" if degree == 1 else "junction",
+        )
 
     point_to_node = {(data["y"], data["x"]): node for node, data in graph.nodes(data=True)}
     visited_edges = set()
@@ -86,11 +92,12 @@ def export_geojson(graph: nx.Graph, path: str | Path) -> None:
     features = []
 
     for node, data in graph.nodes(data=True):
+        node_kind = "endpoint" if data.get("kind") == "endpoint" else "junction"
         features.append(
             {
                 "type": "Feature",
                 "geometry": {"type": "Point", "coordinates": [data["x"], data["y"]]},
-                "properties": {"id": int(node), "kind": "junction"},
+                "properties": {"id": int(node), "kind": node_kind},
             }
         )
 

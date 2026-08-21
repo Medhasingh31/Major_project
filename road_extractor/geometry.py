@@ -68,15 +68,74 @@ class GeometryConfig:
     morphology_close_radius: int = 2
     """Disk radius for morphological closing on the cleaned mask."""
 
+    min_small_component_span_px: int = 12
+    """Minimum major-axis span for preserving a small road-like component."""
+
+    min_small_component_aspect: float = 6.0
+    """Minimum bounding-box aspect ratio for a small elongated component."""
+
+    small_component_context_radius_px: int = 4
+    """Radius used to detect nearby road support around small components."""
+
     # --- spur pruning ---
-    min_branch_length_px: int = 10
+    min_branch_length_px: int = 14
     """Skeleton branches shorter than this (in pixels) are removed as spurs."""
+
+    hard_spur_length_px: float = 7.0
+    """Branches at or below this length are removed when attached to a junction."""
+
+    legitimate_branch_angle_deg: float = 80.0
+    """Minimum branch angle used as evidence for a legitimate short side road."""
+
+    legitimate_branch_mask_support: float = 0.70
+    """Minimum local mask support used to preserve a short side road."""
+
+    legitimate_branch_min_fraction: float = 0.99
+    """Minimum fraction of the spur cutoff for preserving a short side road."""
 
     prune_iterations: int = 10
     """Maximum number of pruning passes (each pass may shorten or remove spurs)."""
 
+    min_skeleton_component_px: int = 22
+    """Remove isolated skeleton components smaller than this pixel count."""
+
+    max_unsupported_branch_length_px: float = 28.0
+    """Upper length bound for the conservative unsupported-branch pass."""
+
+    unsupported_branch_angle_deg: float = 32.0
+    """Near-collinearity threshold for identifying duplicate short arms."""
+
+    branch_support_radius_px: int = 4
+    """Radius used to measure nearby mask/skeleton support around a branch."""
+
+    max_internal_branch_length_px: float = 6.0
+    """Maximum length considered for a suspicious junction-to-junction branch."""
+
+    internal_branch_mask_support: float = 0.45
+    """Minimum independent mask support required to keep a tiny internal branch."""
+
+    # --- gap bridging ---
+    max_gap_bridge_px: float = 7.0
+    """Maximum endpoint-to-endpoint gap to bridge in skeleton pixels."""
+
+    bridge_angle_tolerance_deg: float = 35.0
+    """Maximum tangent angle mismatch allowed for endpoint gap bridging."""
+
+    bridge_mask_support_ratio: float = 0.55
+    """Minimum fraction of a bridge line supported by the dilated road mask."""
+
+    bridge_crossing_clearance_px: int = 1
+    """Ignore expected endpoint neighborhoods when checking bridge crossings."""
+
+    # --- collinear long-range bridging ---
+    collinear_max_gap_px: float = 400.0
+    """Maximum distance for collinear dead-end bridging across large occlusions."""
+
+    collinear_max_angle_deg: float = 22.0
+    """Strict angular alignment tolerance for collinear bridging."""
+
     # --- segment filtering ---
-    min_segment_length_px: float = 8.0
+    min_segment_length_px: float = 10.0
     """Segments shorter than this after tracing are discarded as noise."""
 
     # --- width estimation ---
@@ -200,6 +259,9 @@ def clean_binary_mask(
     repaired_mask: np.ndarray,
     min_area: int = 50,
     close_radius: int = 2,
+    min_small_component_span: int = 12,
+    min_small_component_aspect: float = 2.5,
+    context_radius: int = 4,
 ) -> np.ndarray:
     """
     Produce a clean, hole-free binary road mask from the repaired U-Net output.
@@ -231,14 +293,56 @@ def clean_binary_mask(
         binary, connectivity=8
     )
     cleaned = np.zeros_like(binary)
+    context_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (context_radius * 2 + 1, context_radius * 2 + 1),
+    )
     for lbl in range(1, n_labels):
-        if stats[lbl, cv2.CC_STAT_AREA] >= min_area:
+        area = int(stats[lbl, cv2.CC_STAT_AREA])
+        if area >= min_area:
+            cleaned[labels == lbl] = 1
+            continue
+
+        width = int(stats[lbl, cv2.CC_STAT_WIDTH])
+        height = int(stats[lbl, cv2.CC_STAT_HEIGHT])
+        major = max(width, height)
+        minor = max(min(width, height), 1)
+        aspect = major / minor
+        component = (labels == lbl).astype(np.uint8)
+        nearby = cv2.dilate(component, context_kernel) > 0
+        nearby_support = bool(np.any(nearby & (binary > 0) & (component == 0)))
+        elongated = (
+            major >= min_small_component_span
+            and aspect >= min_small_component_aspect
+        )
+
+        # Compact isolated blobs are noise. Preserve small elongated road-like
+        # fragments, including fragments close to another road component.
+        thin_road_like = (
+            elongated
+            and aspect >= min_small_component_aspect
+            and area <= int(major * 1.5)
+        )
+        if thin_road_like or (nearby_support and elongated):
             cleaned[labels == lbl] = 1
 
-    # --- 3. morphological closing to fill internal holes ---
-    k = close_radius * 2 + 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    closed = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel)
+    # --- 3. component-local closing to fill internal holes ---
+    # Applying closing to the whole image can make two nearby but unrelated
+    # roads touch.  Close each retained component independently so this stage
+    # repairs holes without creating inter-road connections.
+    if close_radius <= 0:
+        closed = cleaned
+    else:
+        k = close_radius * 2 + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        n_clean, clean_labels, _, _ = cv2.connectedComponentsWithStats(
+            cleaned,
+            connectivity=8,
+        )
+        closed = np.zeros_like(cleaned)
+        for clean_label in range(1, n_clean):
+            component = (clean_labels == clean_label).astype(np.uint8)
+            closed |= cv2.morphologyEx(component, cv2.MORPH_CLOSE, kernel)
 
     return (closed > 0).astype(np.uint8)
 
@@ -302,40 +406,85 @@ def _skeleton_neighbors(y: int, x: int, skel: np.ndarray) -> list[tuple[int, int
     ]
 
 
-def _spur_length(
+def _trace_from_endpoint(
     tip_y: int,
     tip_x: int,
     skel: np.ndarray,
     max_steps: int,
-) -> int:
+) -> tuple[list[tuple[int, int]], str]:
     """
-    Walk from a degree-1 pixel (tip) towards the junction, counting steps.
-    Stops when a junction pixel (degree ≥ 3) or another endpoint is reached
-    or after *max_steps* steps.  Returns the walk length.
+    Walk from an endpoint until reaching a junction, another endpoint, or
+    max_steps. Returns the traced path and the terminal condition.
     """
     prev = (-1, -1)
     cur = (tip_y, tip_x)
-    steps = 0
-    while steps < max_steps:
+    path = [cur]
+    while len(path) <= max_steps:
         nbrs = [n for n in _skeleton_neighbors(*cur, skel) if n != prev]
         if not nbrs:
-            break
+            return path, "dead_end"
         nxt = nbrs[0]
-        steps += 1
+        path.append(nxt)
         deg = len(_skeleton_neighbors(*nxt, skel))
         if deg >= 3:
-            break                 # reached a junction
+            return path, "junction"
         if deg == 1 and nxt != (tip_y, tip_x):
-            break                 # reached another endpoint
+            return path, "endpoint"
         prev, cur = cur, nxt
-    return steps
+    return path, "long"
+
+
+def _remove_small_skeleton_components(
+    skeleton: np.ndarray,
+    min_size: int,
+    min_road_like_pixels: int = 10,
+    min_road_like_span: int = 10,
+) -> tuple[np.ndarray, int]:
+    """Remove compact isolated fragments while preserving line-like roads."""
+    binary = (skeleton > 0).astype(np.uint8)
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        binary,
+        connectivity=8,
+    )
+    cleaned = np.zeros_like(binary)
+    removed = 0
+    for lbl in range(1, n_labels):
+        area = int(stats[lbl, cv2.CC_STAT_AREA])
+        if area >= min_size:
+            cleaned[labels == lbl] = 1
+            continue
+
+        width = int(stats[lbl, cv2.CC_STAT_WIDTH])
+        height = int(stats[lbl, cv2.CC_STAT_HEIGHT])
+        component = (labels == lbl).astype(np.uint8)
+        ys, xs = np.where(component > 0)
+        endpoints = sum(
+            len(_skeleton_neighbors(int(y), int(x), component)) == 1
+            for y, x in zip(ys.tolist(), xs.tolist())
+        )
+        line_like = (
+            area >= min_road_like_pixels
+            and max(width, height) >= min_road_like_span
+            and endpoints == 2
+        )
+        if line_like:
+            cleaned[labels == lbl] = 1
+        else:
+            removed += area
+    return cleaned, removed
 
 
 def prune_skeleton_spurs(
     skeleton: np.ndarray,
     min_branch_length: int = 10,
     iterations: int = 10,
-) -> np.ndarray:
+    clean_mask: Optional[np.ndarray] = None,
+    support_radius: int = 4,
+    hard_spur_length: float = 7.0,
+    legitimate_branch_angle: float = 60.0,
+    legitimate_branch_mask_support: float = 0.30,
+    legitimate_branch_min_fraction: float = 0.80,
+) -> tuple[np.ndarray, int]:
     """
     Iteratively remove short dead-end branches (spurs) from the skeleton.
 
@@ -358,6 +507,7 @@ def prune_skeleton_spurs(
     np.ndarray  Pruned skeleton, same shape and dtype.
     """
     skel = skeleton.copy()
+    removed_pixels = 0
 
     for _ in range(iterations):
         changed = False
@@ -372,28 +522,302 @@ def prune_skeleton_spurs(
             if skel[ty, tx] == 0:
                 continue  # already removed in this pass
 
-            length = _spur_length(ty, tx, skel, max_steps=min_branch_length)
-            if length < min_branch_length:
-                # Erase the spur back from the tip to the junction
-                prev = (-1, -1)
-                cur = (ty, tx)
-                for _ in range(length):
-                    skel[cur[0], cur[1]] = 0
-                    nbrs = [
-                        n for n in _skeleton_neighbors(*cur, skel) if n != prev
-                    ]
-                    if not nbrs:
-                        break
-                    # Stop just before a junction
-                    if len(_skeleton_neighbors(*nbrs[0], skel)) >= 3:
-                        break
-                    prev, cur = cur, nbrs[0]
+            path, terminal = _trace_from_endpoint(
+                ty,
+                tx,
+                skel,
+                max_steps=min_branch_length,
+            )
+            branch_length = _arc_length(path)
+            if terminal != "junction" or branch_length >= min_branch_length:
+                continue
+
+            preserve_legitimate_side_road = False
+            if clean_mask is not None:
+                branch_angle = _branch_angle_at_junction(path, skel)
+                mask_support = _local_mask_support(path, clean_mask, support_radius)
+                endpoint_context = (
+                    len(_skeleton_neighbors(ty, tx, skel)) == 1
+                    and terminal == "junction"
+                )
+                relative_to_arms = _is_short_relative_to_junction_arms(path, skel)
+
+                # A short branch is preserved only when independent evidence
+                # agrees that it is a real road arm.  The hard-spur floor
+                # still rejects contact-sized artifacts, while relative arm
+                # length replaces the former near-full-threshold requirement.
+                preserve_legitimate_side_road = (
+                    branch_length > hard_spur_length
+                    and endpoint_context
+                    and branch_angle >= legitimate_branch_angle
+                    and mask_support >= legitimate_branch_mask_support
+                    and (
+                        relative_to_arms
+                        or branch_length >= min_branch_length * 0.50
+                    )
+                )
+
+            # Remove an extremely short branch, or a longer sub-threshold
+            # branch lacking independent evidence of being a real side road.
+            if not preserve_legitimate_side_road:
+                # Erase the spur but keep the junction pixel itself.
+                for py, px in path[:-1]:
+                    if skel[py, px] > 0:
+                        skel[py, px] = 0
+                        removed_pixels += 1
                 changed = True
 
         if not changed:
             break
 
-    return skel
+    return skel, removed_pixels
+
+
+def _local_mask_support(
+    path: list[tuple[int, int]],
+    clean_mask: np.ndarray,
+    radius: int,
+) -> float:
+    """Return the fraction of local disk samples supported by the road mask."""
+    if not path:
+        return 0.0
+    size = radius * 2 + 1
+    disk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size)) > 0
+    values: list[float] = []
+    h, w = clean_mask.shape
+    for y, x in path[:: max(1, len(path) // 12)]:
+        y0, y1 = max(0, y - radius), min(h, y + radius + 1)
+        x0, x1 = max(0, x - radius), min(w, x + radius + 1)
+        local_disk = disk[
+            radius - (y - y0): radius + (y1 - y),
+            radius - (x - x0): radius + (x1 - x),
+        ]
+        local_mask = clean_mask[y0:y1, x0:x1] > 0
+        values.append(float(np.mean(local_mask[local_disk])))
+    return float(np.mean(values)) if values else 0.0
+
+
+def _nearby_skeleton_support(
+    path: list[tuple[int, int]],
+    skeleton: np.ndarray,
+    radius: int,
+) -> float:
+    """Measure whether a short branch runs beside another centerline."""
+    if len(path) < 4:
+        return 0.0
+    branch = np.zeros_like(skeleton, dtype=np.uint8)
+    for y, x in path:
+        branch[y, x] = 1
+    other = ((skeleton > 0) & (branch == 0)).astype(np.uint8)
+    # Do not count the ordinary convergence of arms at the junction as
+    # parallel support. Only nearby centerline evidence away from the node is
+    # useful for identifying a duplicated short arm.
+    junction_y, junction_x = path[-1]
+    cv2.circle(other, (junction_x, junction_y), radius + 1, 0, thickness=-1)
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1)
+    )
+    nearby = cv2.dilate(other, kernel) > 0
+    interior = path[1:-2]
+    return float(np.mean([nearby[y, x] for y, x in interior])) if interior else 0.0
+
+
+def _branch_angle_at_junction(
+    path: list[tuple[int, int]],
+    skeleton: np.ndarray,
+) -> float:
+    """Return the smallest angle between a branch and another junction arm."""
+    if len(path) < 3:
+        return 180.0
+    junction = path[-1]
+    branch_neighbor = path[-2]
+    branch_vector = np.asarray(branch_neighbor, dtype=np.float64) - np.asarray(
+        junction, dtype=np.float64
+    )
+    angles = []
+    for neighbor in _skeleton_neighbors(*junction, skeleton):
+        if neighbor == branch_neighbor:
+            continue
+        other_vector = np.asarray(neighbor, dtype=np.float64) - np.asarray(
+            junction, dtype=np.float64
+        )
+        angles.append(_angle_between_vectors(branch_vector, other_vector))
+    return min(angles) if angles else 180.0
+
+
+def _is_short_relative_to_junction_arms(
+    path: list[tuple[int, int]],
+    skeleton: np.ndarray,
+    ratio: float = 0.70,
+) -> bool:
+    """Require a candidate arm to be materially shorter than its peers."""
+    if len(path) < 3:
+        return False
+    junction = path[-1]
+    branch_neighbor = path[-2]
+    other_lengths: list[float] = []
+    for neighbor in _skeleton_neighbors(*junction, skeleton):
+        if neighbor == branch_neighbor:
+            continue
+        arm = [junction, neighbor]
+        previous, current = junction, neighbor
+        for _ in range(128):
+            degree = len(_skeleton_neighbors(*current, skeleton))
+            if degree != 2:
+                break
+            candidates = [n for n in _skeleton_neighbors(*current, skeleton) if n != previous]
+            if not candidates:
+                break
+            nxt = candidates[0]
+            arm.append(nxt)
+            previous, current = current, nxt
+        other_lengths.append(_arc_length(arm))
+    if len(other_lengths) < 2:
+        return False
+    return _arc_length(path) <= ratio * float(np.median(other_lengths))
+
+
+def prune_unsupported_branches(
+    skeleton: np.ndarray,
+    clean_mask: np.ndarray,
+    max_branch_length: float = 28.0,
+    angle_tolerance_deg: float = 32.0,
+    support_radius: int = 4,
+) -> tuple[np.ndarray, int]:
+    """Remove only short branches with independent evidence of being spurious.
+
+    A branch must terminate at a junction and be short. It is then removed
+    only when it is either near-collinear with another arm while running beside
+    existing skeleton support, or has weak local mask support. This keeps
+    genuine side roads and non-collinear junction arms intact.
+    """
+    skel = skeleton.copy()
+    removed_pixels = 0
+    max_steps = max(32, int(math.ceil(max_branch_length * 2.0)))
+
+    for _ in range(6):
+        changed = False
+        _, endpoints = _classify_pixels(skel)
+        for endpoint in sorted(endpoints):
+            if skel[endpoint] == 0:
+                continue
+            path, terminal = _trace_from_endpoint(
+                endpoint[0], endpoint[1], skel, max_steps=max_steps
+            )
+            branch_length = _arc_length(path)
+            if terminal != "junction" or branch_length > max_branch_length:
+                continue
+
+            angle = _branch_angle_at_junction(path, skel)
+            nearby_support = _nearby_skeleton_support(path, skel, support_radius)
+            mask_support = _local_mask_support(path, clean_mask, support_radius)
+            relatively_short = _is_short_relative_to_junction_arms(path, skel)
+            duplicate_arm = (
+                relatively_short
+                and angle <= angle_tolerance_deg
+                and nearby_support >= 0.35
+            )
+            weak_support = (
+                mask_support < 0.34
+                and branch_length <= 22.0
+                and angle > angle_tolerance_deg
+                and relatively_short
+            )
+            if not (duplicate_arm or weak_support):
+                continue
+
+            for y, x in path[:-1]:
+                if skel[y, x] > 0:
+                    skel[y, x] = 0
+                    removed_pixels += 1
+            changed = True
+
+        if not changed:
+            break
+
+    return skel, removed_pixels
+
+
+def prune_tiny_internal_branches(
+    skeleton: np.ndarray,
+    clean_mask: np.ndarray,
+    max_branch_length: float = 6.0,
+    min_mask_support: float = 0.45,
+    support_radius: int = 4,
+) -> tuple[np.ndarray, int]:
+    """Remove weak, very short branches joining two junctions.
+
+    A spur ending at a junction is handled by ``prune_skeleton_spurs``.  A
+    one/tiny-pixel accidental contact can instead turn into a junction at both
+    ends, leaving no endpoint for that pass to find.  This pass considers only
+    those internal paths, requires them to be very short, and removes them
+    only when the road mask does not independently support their corridor.
+    Paths whose ends are part of the same junction cluster are ignored.
+    """
+    skel = skeleton.copy()
+    removed_pixels = 0
+
+    for _ in range(3):
+        junctions, _ = _classify_pixels(skel)
+        candidates: list[tuple[list[tuple[int, int]], float]] = []
+        seen: set[frozenset[tuple[int, int]]] = set()
+
+        for origin in sorted(junctions):
+            for first in _skeleton_neighbors(*origin, skel):
+                if first in junctions:
+                    continue
+                path = [origin, first]
+                previous, current = origin, first
+                terminal: Optional[tuple[int, int]] = None
+                while len(path) <= int(math.ceil(max_branch_length)) + 2:
+                    degree = len(_skeleton_neighbors(*current, skel))
+                    if degree >= 3:
+                        terminal = current
+                        break
+                    if degree != 2:
+                        break
+                    choices = [
+                        n for n in _skeleton_neighbors(*current, skel)
+                        if n != previous
+                    ]
+                    if not choices:
+                        break
+                    nxt = choices[0]
+                    path.append(nxt)
+                    previous, current = current, nxt
+
+                if terminal is None or terminal == origin:
+                    continue
+                key = frozenset((origin, terminal))
+                if key in seen:
+                    continue
+                seen.add(key)
+                length = _arc_length(path)
+                if length > max_branch_length:
+                    continue
+                # Do not treat adjacent pixels in one thick junction as an
+                # internal road branch.
+                if len(path) <= 2:
+                    continue
+                support = _local_mask_support(path, clean_mask, support_radius)
+                candidates.append((path, support))
+
+        if not candidates:
+            break
+
+        changed = False
+        for path, support in candidates:
+            if support >= min_mask_support:
+                continue
+            for y, x in path[1:-1]:
+                if skel[y, x] > 0:
+                    skel[y, x] = 0
+                    removed_pixels += 1
+                    changed = True
+        if not changed:
+            break
+
+    return skel, removed_pixels
 
 
 # ---------------------------------------------------------------------------
@@ -423,9 +847,286 @@ def _classify_pixels(
     return junctions, endpoints
 
 
+def _count_connected_components(binary: np.ndarray) -> int:
+    """Count foreground connected components in a binary image."""
+    n_labels, _, _, _ = cv2.connectedComponentsWithStats(
+        (binary > 0).astype(np.uint8),
+        connectivity=8,
+    )
+    return max(int(n_labels) - 1, 0)
+
+
+def _angle_between_vectors(a: np.ndarray, b: np.ndarray) -> float:
+    """Return the smaller angle between two 2D vectors in degrees."""
+    na = float(np.linalg.norm(a))
+    nb = float(np.linalg.norm(b))
+    if na == 0.0 or nb == 0.0:
+        return 180.0
+    cosine = float(np.clip(np.dot(a, b) / (na * nb), -1.0, 1.0))
+    return math.degrees(math.acos(cosine))
+
+
+def _endpoint_tangent(
+    endpoint: tuple[int, int],
+    skel: np.ndarray,
+    lookahead: int = 6,
+) -> Optional[np.ndarray]:
+    """
+    Estimate outward direction at an endpoint using the first few centerline
+    pixels behind it. Vector order is [dy, dx] to match (y, x) coordinates.
+    """
+    path, _ = _trace_from_endpoint(
+        endpoint[0],
+        endpoint[1],
+        skel,
+        max_steps=lookahead,
+    )
+    if len(path) < 2:
+        return None
+    anchor = path[min(len(path) - 1, lookahead)]
+    return np.array(
+        [endpoint[0] - anchor[0], endpoint[1] - anchor[1]],
+        dtype=np.float64,
+    )
+
+
+def _line_pixels(
+    p0: tuple[int, int],
+    p1: tuple[int, int],
+    shape: tuple[int, int],
+) -> list[tuple[int, int]]:
+    """Rasterize an inclusive line between two (y, x) pixels."""
+    canvas = np.zeros(shape, dtype=np.uint8)
+    cv2.line(canvas, (p0[1], p0[0]), (p1[1], p1[0]), 1, thickness=1)
+    ys, xs = np.where(canvas > 0)
+    return [(int(y), int(x)) for y, x in zip(ys, xs)]
+
+
+def _bridge_crosses_unrelated_skeleton(
+    p0: tuple[int, int],
+    p1: tuple[int, int],
+    pixels: list[tuple[int, int]],
+    skeleton: np.ndarray,
+    clearance: int = 1,
+) -> bool:
+    """Return whether a proposed bridge intersects other centerline evidence."""
+    obstacle_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (clearance * 2 + 1, clearance * 2 + 1),
+    )
+    nearby_skeleton = cv2.dilate((skeleton > 0).astype(np.uint8), obstacle_kernel)
+    for y, x in pixels:
+        if min(
+            math.hypot(y - p0[0], x - p0[1]),
+            math.hypot(y - p1[0], x - p1[1]),
+        ) <= clearance + 1:
+            continue
+        if nearby_skeleton[y, x] > 0:
+            return True
+    return False
+
+
+def bridge_small_gaps(
+    skeleton: np.ndarray,
+    clean_mask: np.ndarray,
+    max_gap: float = 7.0,
+    angle_tolerance_deg: float = 35.0,
+    mask_support_ratio: float = 0.55,
+    crossing_clearance: int = 1,
+) -> tuple[np.ndarray, int]:
+    """
+    Bridge tiny endpoint-to-endpoint skeleton gaps when local geometry agrees.
+
+    A bridge is accepted only when endpoints are close, their outward tangents
+    face one another, and most bridge pixels lie inside or near the road mask.
+    """
+    skel = skeleton.copy()
+    _, endpoints = _classify_pixels(skel)
+    endpoint_list = sorted(endpoints)
+    if len(endpoint_list) < 2:
+        return skel, 0
+
+    support_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    supported_mask = cv2.dilate((clean_mask > 0).astype(np.uint8), support_kernel)
+    tangents = {pt: _endpoint_tangent(pt, skel) for pt in endpoint_list}
+    used: set[tuple[int, int]] = set()
+    bridges_added = 0
+
+    for i, p0 in enumerate(endpoint_list):
+        if p0 in used:
+            continue
+        best: Optional[tuple[float, tuple[int, int], list[tuple[int, int]]]] = None
+        t0 = tangents.get(p0)
+        if t0 is None:
+            continue
+
+        for p1 in endpoint_list[i + 1:]:
+            if p1 in used:
+                continue
+            dy = p1[0] - p0[0]
+            dx = p1[1] - p0[1]
+            gap = math.sqrt(float(dy * dy + dx * dx))
+            if gap <= 1.5 or gap > max_gap:
+                continue
+
+            t1 = tangents.get(p1)
+            if t1 is None:
+                continue
+
+            gap_vec = np.array([dy, dx], dtype=np.float64)
+            if _angle_between_vectors(t0, gap_vec) > angle_tolerance_deg:
+                continue
+            if _angle_between_vectors(t1, -gap_vec) > angle_tolerance_deg:
+                continue
+            if _angle_between_vectors(t0, -t1) > angle_tolerance_deg:
+                continue
+
+            pixels = _line_pixels(p0, p1, skel.shape)
+            if len(pixels) <= 2:
+                continue
+            if _bridge_crosses_unrelated_skeleton(
+                p0,
+                p1,
+                pixels,
+                skel,
+                clearance=crossing_clearance,
+            ):
+                continue
+            support = np.mean([supported_mask[y, x] > 0 for y, x in pixels])
+            if support < mask_support_ratio:
+                continue
+            if best is None or gap < best[0]:
+                best = (gap, p1, pixels)
+
+        if best is None:
+            continue
+        _, p1, pixels = best
+        for y, x in pixels:
+            skel[y, x] = 1
+        used.add(p0)
+        used.add(p1)
+        bridges_added += 1
+
+    return skel, bridges_added
+
+
+def bridge_collinear_dead_ends(
+    skeleton: np.ndarray,
+    max_gap: float = 400.0,
+    angle_tolerance_deg: float = 22.0,
+    clearance: int = 2,
+) -> tuple[np.ndarray, int]:
+    """
+    Bridge long-range occlusion gaps between dead-end endpoints that are
+    strictly collinear and pointing towards each other across broken canopy/shadows.
+    """
+    skel = skeleton.copy()
+    _, endpoints = _classify_pixels(skel)
+    endpoint_list = sorted(endpoints)
+    if len(endpoint_list) < 2:
+        return skel, 0
+
+    tangents = {pt: _endpoint_tangent(pt, skel) for pt in endpoint_list}
+    used: set[tuple[int, int]] = set()
+    bridges_added = 0
+
+    pairs = []
+    for i, p0 in enumerate(endpoint_list):
+        t0 = tangents.get(p0)
+        if t0 is None:
+            continue
+        for p1 in endpoint_list[i + 1:]:
+            t1 = tangents.get(p1)
+            if t1 is None:
+                continue
+            dy = p1[0] - p0[0]
+            dx = p1[1] - p0[1]
+            gap = math.sqrt(float(dy * dy + dx * dx))
+            if gap <= 7.0 or gap > max_gap:
+                continue
+            gap_vec = np.array([dy, dx], dtype=np.float64)
+            a0 = _angle_between_vectors(t0, gap_vec)
+            a1 = _angle_between_vectors(t1, -gap_vec)
+            ao = _angle_between_vectors(t0, -t1)
+            if a0 <= angle_tolerance_deg and a1 <= angle_tolerance_deg and ao <= angle_tolerance_deg + 5.0:
+                pairs.append((gap, p0, p1))
+
+    pairs.sort(key=lambda x: x[0])
+    for gap, p0, p1 in pairs:
+        if p0 in used or p1 in used:
+            continue
+        pixels = _line_pixels(p0, p1, skel.shape)
+        if len(pixels) <= 2:
+            continue
+        if _bridge_crosses_unrelated_skeleton(p0, p1, pixels, skel, clearance=clearance):
+            continue
+        for y, x in pixels:
+            skel[y, x] = 1
+        used.add(p0)
+        used.add(p1)
+        bridges_added += 1
+
+    return skel, bridges_added
+
+
 # ---------------------------------------------------------------------------
 # Step 5 — Segment tracing
 # ---------------------------------------------------------------------------
+
+def _cluster_pixel_set(
+    pixels: set[tuple[int, int]],
+) -> tuple[list[set[tuple[int, int]]], dict[tuple[int, int], int]]:
+    """Group 8-connected pixels, used to collapse junction blobs."""
+    remaining = set(pixels)
+    clusters: list[set[tuple[int, int]]] = []
+    pixel_to_cluster: dict[tuple[int, int], int] = {}
+
+    while remaining:
+        seed = remaining.pop()
+        cluster = {seed}
+        stack = [seed]
+        while stack:
+            y, x = stack.pop()
+            for dy, dx in _N8:
+                nbr = (y + dy, x + dx)
+                if nbr in remaining:
+                    remaining.remove(nbr)
+                    cluster.add(nbr)
+                    stack.append(nbr)
+
+        cluster_id = len(clusters)
+        for pixel in cluster:
+            pixel_to_cluster[pixel] = cluster_id
+        clusters.append(cluster)
+
+    return clusters, pixel_to_cluster
+
+
+def _same_junction_cluster(
+    p0: tuple[int, int],
+    p1: tuple[int, int],
+    junction_cluster_by_pixel: dict[tuple[int, int], int],
+) -> bool:
+    c0 = junction_cluster_by_pixel.get(p0)
+    c1 = junction_cluster_by_pixel.get(p1)
+    return c0 is not None and c0 == c1
+
+
+def _junction_representatives(
+    clusters: list[set[tuple[int, int]]],
+) -> list[tuple[int, int]]:
+    """Pick one stable center pixel for each junction cluster."""
+    representatives: list[tuple[int, int]] = []
+    for cluster in clusters:
+        pts = np.array(sorted(cluster), dtype=np.float64)
+        centroid = pts.mean(axis=0)
+        best = min(
+            cluster,
+            key=lambda p: (p[0] - centroid[0]) ** 2 + (p[1] - centroid[1]) ** 2,
+        )
+        representatives.append((int(best[0]), int(best[1])))
+    return sorted(representatives)
+
 
 def _trace_segment(
     start: tuple[int, int],
@@ -639,6 +1340,9 @@ def extract_geometry(
         repaired_mask,
         min_area=cfg.min_road_area_px,
         close_radius=cfg.morphology_close_radius,
+        min_small_component_span=cfg.min_small_component_span_px,
+        min_small_component_aspect=cfg.min_small_component_aspect,
+        context_radius=cfg.small_component_context_radius_px,
     )
 
     # ------------------------------------------------------------------
@@ -647,27 +1351,74 @@ def extract_geometry(
     raw_skeleton = extract_skeleton(clean_mask)
 
     # ------------------------------------------------------------------
-    # 3. Prune short dead-end spurs (noisy branches)
+    # 3. Prune short dead-end spurs and tiny isolated fragments
     # ------------------------------------------------------------------
-    skeleton = prune_skeleton_spurs(
+    pruned_skeleton, pruned_spur_pixels = prune_skeleton_spurs(
         raw_skeleton,
         min_branch_length=cfg.min_branch_length_px,
         iterations=cfg.prune_iterations,
+        clean_mask=clean_mask,
+        support_radius=cfg.branch_support_radius_px,
+        hard_spur_length=cfg.hard_spur_length_px,
+        legitimate_branch_angle=cfg.legitimate_branch_angle_deg,
+        legitimate_branch_mask_support=cfg.legitimate_branch_mask_support,
+        legitimate_branch_min_fraction=cfg.legitimate_branch_min_fraction,
+    )
+    pruned_skeleton, unsupported_branch_pixels = prune_unsupported_branches(
+        pruned_skeleton,
+        clean_mask,
+        max_branch_length=cfg.max_unsupported_branch_length_px,
+        angle_tolerance_deg=cfg.unsupported_branch_angle_deg,
+        support_radius=cfg.branch_support_radius_px,
+    )
+    pruned_skeleton, internal_branch_pixels = prune_tiny_internal_branches(
+        pruned_skeleton,
+        clean_mask,
+        max_branch_length=cfg.max_internal_branch_length_px,
+        min_mask_support=cfg.internal_branch_mask_support,
+        support_radius=cfg.branch_support_radius_px,
+    )
+    pruned_skeleton, removed_component_pixels = _remove_small_skeleton_components(
+        pruned_skeleton,
+        min_size=cfg.min_skeleton_component_px,
+        min_road_like_pixels=max(10, cfg.min_skeleton_component_px // 2),
+        min_road_like_span=cfg.min_small_component_span_px,
     )
 
     # ------------------------------------------------------------------
-    # 4. Classify skeleton pixels → junctions and endpoints
+    # 4. Bridge endpoint gaps when local & collinear geometry justifies it
+    # ------------------------------------------------------------------
+    skeleton, bridges_added = bridge_small_gaps(
+        pruned_skeleton,
+        clean_mask,
+        max_gap=cfg.max_gap_bridge_px,
+        angle_tolerance_deg=cfg.bridge_angle_tolerance_deg,
+        mask_support_ratio=cfg.bridge_mask_support_ratio,
+        crossing_clearance=cfg.bridge_crossing_clearance_px,
+    )
+    if getattr(cfg, "collinear_max_gap_px", 0.0) > 0:
+        skeleton, collinear_added = bridge_collinear_dead_ends(
+            skeleton,
+            max_gap=cfg.collinear_max_gap_px,
+            angle_tolerance_deg=cfg.collinear_max_angle_deg,
+        )
+        bridges_added += collinear_added
+
+    # ------------------------------------------------------------------
+    # 5. Classify skeleton pixels → junctions and endpoints
     # ------------------------------------------------------------------
     junctions, endpoints = _classify_pixels(skeleton)
+    junction_clusters, junction_cluster_by_pixel = _cluster_pixel_set(junctions)
+    junction_representatives = _junction_representatives(junction_clusters)
     special = junctions | endpoints
 
     # ------------------------------------------------------------------
-    # 5. Build distance transform on clean mask (for width estimation)
+    # 6. Build distance transform on clean mask (for width estimation)
     # ------------------------------------------------------------------
     dist_transform = _build_distance_transform(clean_mask)
 
     # ------------------------------------------------------------------
-    # 6. Trace all road segments between special pixels
+    # 7. Trace all road segments between special pixels
     #    Each edge in the skeleton graph becomes one RoadSegment.
     # ------------------------------------------------------------------
     segments: list[RoadSegment] = []
@@ -683,6 +1434,8 @@ def extract_geometry(
                 continue
             if skeleton[ny, nx] == 0:
                 continue
+            if _same_junction_cluster(origin, (ny, nx), junction_cluster_by_pixel):
+                continue
 
             edge_key = frozenset({origin, (ny, nx)})
             if edge_key in visited_edges:
@@ -695,9 +1448,46 @@ def extract_geometry(
             for k in range(len(path) - 1):
                 visited_edges.add(frozenset({path[k], path[k + 1]}))
 
-            # Discard very short fragments (noise)
+            # Discard very short fragments unless the path is a supported
+            # connection between two distinct topology nodes.  A fixed
+            # length gate alone removes legitimate short junction arms and
+            # short pieces of disconnected roads.
             arc = _arc_length(path)
-            if arc < cfg.min_segment_length_px or len(path) < 2:
+            start_node = (
+                ("junction", junction_cluster_by_pixel[path[0]])
+                if path[0] in junction_cluster_by_pixel
+                else ("endpoint", path[0])
+                if path[0] in endpoints
+                else None
+            )
+            end_node = (
+                ("junction", junction_cluster_by_pixel[path[-1]])
+                if path[-1] in junction_cluster_by_pixel
+                else ("endpoint", path[-1])
+                if path[-1] in endpoints
+                else None
+            )
+            connects_distinct_nodes = (
+                start_node is not None
+                and end_node is not None
+                and start_node != end_node
+            )
+            short_path_support = _local_mask_support(
+                path,
+                clean_mask,
+                cfg.branch_support_radius_px,
+            )
+            preserve_supported_short = (
+                len(path) >= 3
+                and connects_distinct_nodes
+                and short_path_support >= cfg.legitimate_branch_mask_support
+            )
+            if (
+                (arc < cfg.min_segment_length_px or len(path) < 2)
+                and not preserve_supported_short
+            ):
+                continue
+            if _same_junction_cluster(path[0], path[-1], junction_cluster_by_pixel):
                 continue
 
             seg = RoadSegment(
@@ -714,16 +1504,29 @@ def extract_geometry(
             seg_id += 1
 
     # ------------------------------------------------------------------
-    # 7. Assemble and return
+    # 8. Assemble and return
     # ------------------------------------------------------------------
     metadata = {
         "image_shape":          list(rgb_image.shape[:2]),
+        "input_mask_shape":     list(repaired_mask.shape[:2]),
+        "input_road_pixels":    int(np.sum(repaired_mask > 0)),
+        "clean_mask_connected_components": _count_connected_components(clean_mask),
         "raw_skeleton_pixels":  int(np.sum(raw_skeleton)),
         "pruned_skeleton_pixels": int(np.sum(skeleton)),
-        "spurs_removed_pixels": int(np.sum(raw_skeleton)) - int(np.sum(skeleton)),
+        "skeleton_connected_components": _count_connected_components(skeleton),
+        "spurs_removed_pixels": int(
+            pruned_spur_pixels + unsupported_branch_pixels + removed_component_pixels
+        ),
+        "unsupported_branch_pixels_removed": int(unsupported_branch_pixels),
+        "internal_branch_pixels_removed": int(internal_branch_pixels),
+        "net_skeleton_pixel_delta": int(np.sum(skeleton)) - int(np.sum(raw_skeleton)),
+        "dead_end_spur_pixels_removed": int(pruned_spur_pixels),
+        "small_component_pixels_removed": int(removed_component_pixels),
+        "small_gaps_bridged": int(bridges_added),
         "clean_mask_pixels":    int(np.sum(clean_mask)),
         "segment_count":        len(segments),
-        "junction_count":       len(junctions),
+        "junction_pixel_count": len(junctions),
+        "junction_count":       len(junction_clusters),
         "endpoint_count":       len(endpoints),
         "total_length_pixels":  round(sum(s.length_pixels for s in segments), 2),
         "mean_width_pixels":    round(
@@ -733,7 +1536,7 @@ def extract_geometry(
 
     return RoadGeometry(
         segments=segments,
-        junctions=sorted(junctions),
+        junctions=junction_representatives,
         endpoints=sorted(endpoints),
         metadata=metadata,
         skeleton=skeleton,
@@ -763,3 +1566,45 @@ def save_clean_mask_image(geometry: RoadGeometry, path: str | Path) -> None:
     """Save the cleaned binary mask as a grayscale PNG."""
     if geometry.clean_mask is not None:
         cv2.imwrite(str(path), geometry.clean_mask * 255)
+
+
+def save_geometry_diagnostic(
+    rgb_image: np.ndarray,
+    geometry: RoadGeometry,
+    path: str | Path,
+) -> None:
+    """Save an RGB diagnostic overlay of segments, endpoints, and junctions."""
+    canvas = rgb_image.copy()
+
+    if geometry.skeleton is not None:
+        canvas[geometry.skeleton > 0] = (
+            0.35 * canvas[geometry.skeleton > 0]
+            + 0.65 * np.array([40, 220, 255], dtype=np.uint8)
+        ).astype(np.uint8)
+
+    bgr = cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR)
+    palette = [
+        (0, 255, 255),
+        (255, 160, 0),
+        (120, 255, 120),
+        (255, 80, 220),
+        (80, 160, 255),
+    ]
+
+    for segment in geometry.segments:
+        color = palette[segment.segment_id % len(palette)]
+        points = np.array(
+            [[x, y] for y, x in segment.pixel_path],
+            dtype=np.int32,
+        )
+        if len(points) >= 2:
+            cv2.polylines(bgr, [points], isClosed=False, color=color, thickness=2)
+
+    for y, x in geometry.endpoints:
+        cv2.circle(bgr, (x, y), radius=4, color=(0, 0, 255), thickness=-1)
+
+    for y, x in geometry.junctions:
+        cv2.circle(bgr, (x, y), radius=5, color=(255, 0, 0), thickness=2)
+
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(path), bgr)
