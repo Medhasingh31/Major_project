@@ -16,6 +16,26 @@ def list_image_files(folder: str | Path) -> list[Path]:
 
 
 def read_rgb(path: str | Path) -> np.ndarray:
+    if str(path).lower().endswith(('.tif', '.tiff')):
+        import rasterio
+        with rasterio.open(path) as src:
+            if src.count >= 3:
+                img = src.read([1, 2, 3])
+                img = np.moveaxis(img, 0, -1)
+            else:
+                img = src.read(1)
+                img = np.stack([img, img, img], axis=-1)
+            
+            # Normalize high dynamic range or floats to standard uint8
+            if img.dtype != np.uint8:
+                img_min = img.min()
+                img_max = img.max()
+                if img_max > img_min:
+                    img = ((img - img_min) / (img_max - img_min) * 255.0).astype(np.uint8)
+                else:
+                    img = img.astype(np.uint8)
+            return img
+
     image = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if image is None:
         raise FileNotFoundError(f"Could not read image: {path}")

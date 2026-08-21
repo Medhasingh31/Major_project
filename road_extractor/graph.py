@@ -90,23 +90,49 @@ def export_graphml(graph: nx.Graph, path: str | Path) -> None:
 
 def export_geojson(graph: nx.Graph, path: str | Path) -> None:
     features = []
+    
+    transform_val_raw = graph.graph.get('transform')
+    if isinstance(transform_val_raw, str):
+        transform_vals = json.loads(transform_val_raw)
+    else:
+        transform_vals = transform_val_raw
+    crs_wkt = graph.graph.get('crs')
+    
+    def transform_pt(x, y):
+        if transform_vals and crs_wkt:
+            from rasterio.transform import Affine
+            import rasterio.warp
+            try:
+                t = Affine(*transform_vals)
+                wx, wy = t * (x, y)
+                xs, ys = rasterio.warp.transform(crs_wkt, 'EPSG:4326', [wx], [wy])
+                return [xs[0], ys[0]]
+            except Exception as e:
+                print(f"CRS Transformation failed: {e}")
+                if transform_vals:
+                    t = Affine(*transform_vals)
+                    wx, wy = t * (x, y)
+                    return [wx, wy]
+        return [x, y]
 
     for node, data in graph.nodes(data=True):
         node_kind = "endpoint" if data.get("kind") == "endpoint" else "junction"
+        coords = transform_pt(data["x"], data["y"])
         features.append(
             {
                 "type": "Feature",
-                "geometry": {"type": "Point", "coordinates": [data["x"], data["y"]]},
+                "geometry": {"type": "Point", "coordinates": coords},
                 "properties": {"id": int(node), "kind": node_kind},
             }
         )
 
     for source, target, data in graph.edges(data=True):
-        coordinates = json.loads(data["pixels"])
+        pixel_coords = json.loads(data["pixels"])
+        geo_coords = [transform_pt(pt[0], pt[1]) for pt in pixel_coords]
         features.append(
             {
                 "type": "Feature",
-                "geometry": {"type": "LineString", "coordinates": coordinates},
+                "geometry": {"type": "LineString", "coordinates": geo_coords},
                 "properties": {
                     "source": int(source),
                     "target": int(target),
@@ -117,4 +143,13 @@ def export_geojson(graph: nx.Graph, path: str | Path) -> None:
         )
 
     geojson = {"type": "FeatureCollection", "features": features}
+    
+    if crs_wkt:
+        geojson["crs"] = {
+            "type": "name",
+            "properties": {
+                "name": "urn:ogc:def:crs:OGC:1.3:CRS84"
+            }
+        }
+        
     Path(path).write_text(json.dumps(geojson, indent=2), encoding="utf-8")

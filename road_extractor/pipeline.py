@@ -71,11 +71,14 @@ def _predict_tiled(
     tile_size: int = 256,
     stride: int = 128,
     batch_size: int = 8,
+    progress_file_path: str | None = None,
 ) -> np.ndarray:
     """
     Overlapping sliding-window tiled inference at native resolution.
     Applies 2D Hann window blending to eliminate seam artifacts and batched 4-way TTA.
+    Optimized to iterate in small mini-batches to prevent memory exhaustion on large satellite images.
     """
+    import gc
     h, w = image_rgb.shape[:2]
 
     # Handle edge case where image is smaller than tile_size
@@ -100,35 +103,56 @@ def _predict_tiled(
     if (w - tile_size) > 0 and (w - tile_size) % stride != 0:
         xs.append(w - tile_size)
 
-    patches = []
-    coords = []
+    all_coords = []
     for y in ys:
         for x in xs:
+            all_coords.append((y, x))
+
+    total_tiles = len(all_coords)
+
+    # Process sequentially in mini-batches
+    for idx in range(0, total_tiles, batch_size):
+        batch_coords = all_coords[idx : idx + batch_size]
+        patches = []
+        for y, x in batch_coords:
             patch = image_rgb[y:y+tile_size, x:x+tile_size]
             if patch.shape[0] < tile_size or patch.shape[1] < tile_size:
                 patch = cv2.resize(patch, (tile_size, tile_size))
             patches.append(patch.astype(np.float32) / 255.0)
-            coords.append((y, x))
 
-    patches_arr = np.array(patches)
+        patches_arr = np.array(patches)
 
-    # Batched 4-way Test-Time Augmentation
-    p1 = model.predict(patches_arr, batch_size=batch_size, verbose=0)[:, :, :, 0]
-    p2 = model.predict(np.flip(patches_arr, axis=2), batch_size=batch_size, verbose=0)[:, :, :, 0]
-    p2 = np.flip(p2, axis=2)
-    p3 = model.predict(np.flip(patches_arr, axis=1), batch_size=batch_size, verbose=0)[:, :, :, 0]
-    p3 = np.flip(p3, axis=1)
-    p4 = model.predict(np.rot90(patches_arr, k=1, axes=(1, 2)), batch_size=batch_size, verbose=0)[:, :, :, 0]
-    p4 = np.rot90(p4, k=-1, axes=(1, 2))
+        # Batched 4-way Test-Time Augmentation
+        p1 = model.predict(patches_arr, batch_size=len(patches), verbose=0)[:, :, :, 0]
+        p2 = model.predict(np.flip(patches_arr, axis=2), batch_size=len(patches), verbose=0)[:, :, :, 0]
+        p2 = np.flip(p2, axis=2)
+        p3 = model.predict(np.flip(patches_arr, axis=1), batch_size=len(patches), verbose=0)[:, :, :, 0]
+        p3 = np.flip(p3, axis=1)
+        p4 = model.predict(np.rot90(patches_arr, k=1, axes=(1, 2)), batch_size=len(patches), verbose=0)[:, :, :, 0]
+        p4 = np.rot90(p4, k=-1, axes=(1, 2))
 
-    tta_preds = (p1 + p2 + p3 + p4) / 4.0
+        tta_preds = (p1 + p2 + p3 + p4) / 4.0
 
-    # Accumulate into global probability and weight maps
-    for (y, x), pred in zip(coords, tta_preds):
-        h_eff = min(tile_size, h - y)
-        w_eff = min(tile_size, w - x)
-        prob_map[y:y+h_eff, x:x+w_eff] += pred[:h_eff, :w_eff] * window[:h_eff, :w_eff]
-        weight_map[y:y+h_eff, x:x+w_eff] += window[:h_eff, :w_eff]
+        # Accumulate into global probability and weight maps
+        for (y, x), pred in zip(batch_coords, tta_preds):
+            h_eff = min(tile_size, h - y)
+            w_eff = min(tile_size, w - x)
+            prob_map[y:y+h_eff, x:x+w_eff] += pred[:h_eff, :w_eff] * window[:h_eff, :w_eff]
+            weight_map[y:y+h_eff, x:x+w_eff] += window[:h_eff, :w_eff]
+
+        current_count = min(idx + batch_size, total_tiles)
+        prog_msg = f"Processing tile {current_count} / {total_tiles}"
+        print(prog_msg)
+        if progress_file_path:
+            try:
+                with open(progress_file_path, 'w') as pf:
+                    pf.write(prog_msg + "\n")
+            except:
+                pass
+
+        # Deallocate memory explicitly
+        del patches_arr, p1, p2, p3, p4, tta_preds
+        gc.collect()
 
     return prob_map / np.maximum(weight_map, 1e-6)
 
@@ -137,6 +161,7 @@ def predict_mask_with_model(
     image: np.ndarray,
     weights_path: str | Path,
     config: ExtractionConfig,
+    progress_file_path: str | None = None,
 ) -> np.ndarray:
     from tensorflow import keras
     from road_extractor.model import build_light_unet
@@ -161,6 +186,7 @@ def predict_mask_with_model(
             image,
             tile_size=config.tile_size,
             stride=config.tile_stride,
+            progress_file_path=progress_file_path,
         )
         gw = getattr(config, "global_weight", 0.25)
         lw = getattr(config, "local_weight", 0.75)
@@ -172,6 +198,7 @@ def predict_mask_with_model(
             image,
             tile_size=config.tile_size,
             stride=config.tile_stride,
+            progress_file_path=progress_file_path,
         )
     else:
         prediction = pred_global_up
@@ -198,14 +225,17 @@ def extract_roads(
     output_dir: str | Path,
     weights_path: str | Path | None = None,
     config: ExtractionConfig | None = None,
+    crs: str | None = None,
+    transform: list[float] | None = None,
 ) -> dict[str, object]:
     config = config or ExtractionConfig()
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     image = read_rgb(image_path)
+    progress_path = output_dir / "progress.txt"
     if weights_path:
-        raw_mask = predict_mask_with_model(image, weights_path, config)
+        raw_mask = predict_mask_with_model(image, weights_path, config, progress_file_path=str(progress_path))
     else:
         raw_mask = classical_road_candidate_mask(image)
 
@@ -225,6 +255,11 @@ def extract_roads(
         ),
     )
     topology = build_topology(geometry)
+    if topology.graph is not None:
+        if crs:
+            topology.graph.graph['crs'] = crs
+        if transform:
+            topology.graph.graph['transform'] = json.dumps(transform)
     _prepare_graph_exports(topology, geometry)
     raw_skeleton = extract_skeleton(geometry.clean_mask) if geometry.clean_mask is not None else np.zeros_like(repaired_mask)
 

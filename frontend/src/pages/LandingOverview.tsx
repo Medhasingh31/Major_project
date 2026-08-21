@@ -14,34 +14,34 @@ import { apiService } from '../services/api';
 
 export default function LandingOverview() {
   const [recentRuns, setRecentRuns] = useState<{ id: string; name: string; date: string; segments: number; length: string }[]>([]);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  const fetchRuns = async () => {
+    try {
+      setErrorMsg(null);
+      const data = await apiService.getRuns();
+      setRecentRuns(data);
+    } catch (err: any) {
+      console.error("Failed to load runs history:", err);
+      setErrorMsg(err.message || "Failed to load runs history from server.");
+    }
+  };
 
   useEffect(() => {
-    // Collect runs from session storage + default mock
-    const runs = [
-      { id: 'proj-001', name: 'Meridian County Corridor', date: '2026-08-21', segments: 342, length: '124.8 km' }
-    ];
-
-    // Scan sessionStorage for real user jobs
-    for (let i = 0; i < sessionStorage.length; i++) {
-      const key = sessionStorage.key(i);
-      if (key && key.startsWith('analysis_result_')) {
-        try {
-          const raw = sessionStorage.getItem(key);
-          if (raw) {
-            const data = JSON.parse(raw);
-            runs.unshift({
-              id: data.projectId,
-              name: data.projectName || 'Recent Run',
-              date: data.created_at || new Date().toISOString().split('T')[0],
-              segments: data.networkSummary?.totalSegments || 0,
-              length: `${data.networkSummary?.totalRoadLength?.value || 0} ${data.networkSummary?.totalRoadLength?.unit || 'km'}`
-            });
-          }
-        } catch {}
-      }
-    }
-    setRecentRuns(runs);
+    fetchRuns();
   }, []);
+
+  const handleDeleteRun = async (jobId: string) => {
+    if (!window.confirm(`Are you sure you want to permanently delete run "${jobId}"? This will delete all files on the backend.`)) {
+      return;
+    }
+    try {
+      await apiService.deleteRun(jobId);
+      await fetchRuns();
+    } catch (err: any) {
+      alert(`Delete failed: ${err.message || 'Error occurred.'}`);
+    }
+  };
 
   return (
     <div className="h-full overflow-y-auto p-8 space-y-8 bg-[#070a0e] gis-grid">
@@ -81,6 +81,11 @@ export default function LandingOverview() {
         {/* Left 2 cols: Recent runs */}
         <div className="lg:col-span-2 border border-[#1f242c] bg-[#0b0f14]/80 rounded-lg p-6 space-y-4">
           <h3 className="text-sm font-semibold text-white tracking-wider font-mono uppercase">Recent Extraction Tasks</h3>
+          {errorMsg && (
+            <div className="p-3 border border-red-500/30 bg-red-950/20 rounded text-[11px] font-mono text-red-400">
+              {errorMsg}
+            </div>
+          )}
           <div className="overflow-hidden border border-[#1f242c] rounded">
             <table className="w-full text-left text-sm text-gray-400">
               <thead className="text-[10px] uppercase font-mono tracking-widest text-gray-500 border-b border-[#1f242c] bg-gray-900/50">
@@ -102,13 +107,19 @@ export default function LandingOverview() {
                     <td className="px-6 py-4 font-mono">{run.segments}</td>
                     <td className="px-6 py-4 font-mono">{run.length}</td>
                     <td className="px-6 py-4 text-xs text-gray-500">{run.date}</td>
-                    <td className="px-6 py-4">
+                    <td className="px-6 py-4 flex gap-4 items-center">
                       <Link 
                         to={`/workspace?runId=${run.id}`}
                         className="text-xs text-emerald-400 hover:text-emerald-300 font-semibold"
                       >
                         Load Workspace →
                       </Link>
+                      <button 
+                        onClick={() => handleDeleteRun(run.id)}
+                        className="text-xs text-red-400 hover:text-red-300 font-semibold cursor-pointer border-none bg-transparent outline-none"
+                      >
+                        Delete
+                      </button>
                     </td>
                   </tr>
                 ))}

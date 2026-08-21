@@ -58,6 +58,9 @@ export default function AnalysisWorkspace() {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [result, setResult] = useState<AnalysisResult | null>(null);
   const [selectedIssue, setSelectedIssue] = useState<FlaggedIssue | null>(null);
+  const [isGeneratingReport, setIsGeneratingReport] = useState(false);
+  const [reportError, setReportError] = useState<string | null>(null);
+  const [progressMessage, setProgressMessage] = useState<string | null>(null);
 
   // Load project if runId is in search query
   useEffect(() => {
@@ -83,6 +86,26 @@ export default function AnalysisWorkspace() {
       }
     } finally {
       setIsProcessing(false);
+    }
+  };
+
+  const handleGenerateReport = async () => {
+    if (!result) return;
+    setIsGeneratingReport(true);
+    setReportError(null);
+    try {
+      const res = await apiService.generateReport(result.projectId);
+      const link = document.createElement('a');
+      link.href = res.reportUrl;
+      link.setAttribute('download', 'analysis_report.pdf');
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    } catch (err: any) {
+      console.error("PDF generation failed:", err);
+      setReportError(err.message || "Failed to generate report.");
+    } finally {
+      setIsGeneratingReport(false);
     }
   };
 
@@ -124,12 +147,12 @@ export default function AnalysisWorkspace() {
     setErrorMsg(null);
     setResult(null);
     setSelectedIssue(null);
+    setProgressMessage(null);
     setProgressStages(INITIAL_STAGES.map(s => ({ ...s, status: 'idle' })));
     setActiveStageIdx(0);
 
     const jobId = `job-${Date.now()}`;
 
-    // Pipeline stage animations simulation
     const updateStage = (idx: number, status: 'processing' | 'completed' | 'failed') => {
       setProgressStages(prev => prev.map((s, i) => {
         if (i === idx) return { ...s, status };
@@ -137,6 +160,27 @@ export default function AnalysisWorkspace() {
         return s;
       }));
       setActiveStageIdx(idx);
+    };
+
+    let progressInterval: any = null;
+    const startPollingProgress = () => {
+      progressInterval = setInterval(async () => {
+        try {
+          const res = await apiService.getProgress(jobId);
+          if (res.success && res.progress) {
+            setProgressMessage(res.progress);
+          }
+        } catch (e) {
+          console.warn("Failed to check progress:", e);
+        }
+      }, 1500);
+    };
+
+    const stopPollingProgress = () => {
+      if (progressInterval) {
+        clearInterval(progressInterval);
+        progressInterval = null;
+      }
     };
 
     try {
@@ -149,8 +193,8 @@ export default function AnalysisWorkspace() {
       updateStage(2, 'processing');
       await new Promise(r => setTimeout(r, 500));
       
-      // Dispatch requests to actual backend pipeline
       updateStage(3, 'processing');
+      startPollingProgress();
       
       const responseData = await apiService.submitAnalysis(
         fileToUpload,
@@ -160,6 +204,9 @@ export default function AnalysisWorkspace() {
         studyArea,
         imageYear
       );
+
+      stopPollingProgress();
+      setProgressMessage("Tiling prediction complete. Reconstructing full georeferenced raster...");
 
       updateStage(4, 'processing');
       await new Promise(r => setTimeout(r, 400));
@@ -174,13 +221,17 @@ export default function AnalysisWorkspace() {
 
       setProgressStages(prev => prev.map(s => ({ ...s, status: 'completed' })));
       setResult(responseData);
+      setProgressMessage(null);
       
       sessionStorage.setItem(`analysis_result_${jobId}`, JSON.stringify(responseData));
 
     } catch (err: any) {
+      stopPollingProgress();
+      setProgressMessage(null);
       setProgressStages(prev => prev.map((s, i) => i === activeStageIdx ? { ...s, status: 'failed' } : s));
       setErrorMsg(err.message || 'Pipeline extraction failed.');
     } finally {
+      stopPollingProgress();
       setIsProcessing(false);
     }
   };
@@ -347,6 +398,12 @@ export default function AnalysisWorkspace() {
                   <div className="bg-emerald-500 h-full animate-progress" style={{ width: `${((activeStageIdx + 1) / progressStages.length) * 100}%` }} />
                 </div>
               </div>
+              
+              {progressMessage && (
+                <div className="text-[11px] text-emerald-400 font-mono animate-pulse border border-emerald-500/25 bg-emerald-950/20 px-3 py-1.5 rounded w-80 text-center">
+                  {progressMessage}
+                </div>
+              )}
 
               {/* Progress Steps list */}
               <div className="w-80 space-y-2.5 font-mono text-xs border border-[#1f242c] p-4 rounded bg-gray-950/45">
@@ -456,6 +513,20 @@ export default function AnalysisWorkspace() {
             <div className="space-y-2">
               <label className="text-[10px] text-gray-500 font-bold uppercase tracking-wider font-mono">Exports & GIS Outputs</label>
               <div className="space-y-1.5 font-mono text-[10px]">
+                <button 
+                  onClick={handleGenerateReport}
+                  disabled={isGeneratingReport}
+                  className="w-full flex justify-between items-center bg-emerald-500 hover:bg-emerald-400 disabled:bg-emerald-800 disabled:text-emerald-500 text-gray-950 font-bold rounded px-3 py-2 transition-colors cursor-pointer"
+                >
+                  <span>{isGeneratingReport ? 'Generating Report PDF...' : 'Generate PDF Report'}</span>
+                  <Download className={`h-3.5 w-3.5 ${isGeneratingReport ? 'animate-bounce' : ''}`} />
+                </button>
+                {reportError && (
+                  <div className="text-red-400 text-[9px] mt-1">
+                    {reportError}
+                  </div>
+                )}
+                <div className="h-1" />
                 <a 
                   href={apiService.getLayerUrl(result.projectId, 'geojson')} 
                   download 
