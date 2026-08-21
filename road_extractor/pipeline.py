@@ -220,7 +220,6 @@ def extract_roads(
         repaired_mask,
         config=GeometryConfig(
             min_road_area_px=config.min_object_size,
-            morphology_close_radius=config.closing_radius,
             collinear_max_gap_px=getattr(config, "collinear_max_gap", 400.0),
             collinear_max_angle_deg=getattr(config, "collinear_max_angle", 22.0),
         ),
@@ -244,7 +243,6 @@ def extract_roads(
     save_final_graph_overlay(image, topology.graph, output_dir / "road_graph.png")
     save_geometry_json(geometry, output_dir / "geometry_summary.json")
     save_topology_json(topology, output_dir / "topology_summary.json")
-    
     with open(output_dir / "confidence_summary.json", "w") as f:
         json.dump(confidence_report.to_summary(), f, indent=4)
 

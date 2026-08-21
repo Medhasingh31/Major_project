@@ -133,7 +133,6 @@ class GeometryConfig:
 
     collinear_max_angle_deg: float = 22.0
     """Strict angular alignment tolerance for collinear bridging."""
-
     # --- segment filtering ---
     min_segment_length_px: float = 10.0
     """Segments shorter than this after tracing are discarded as noise."""
@@ -1067,7 +1066,6 @@ def bridge_collinear_dead_ends(
         bridges_added += 1
 
     return skel, bridges_added
-
 
 # ---------------------------------------------------------------------------
 # Step 5 — Segment tracing
